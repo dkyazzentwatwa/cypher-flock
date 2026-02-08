@@ -157,6 +157,10 @@ static volatile bool         fySerialHostConnected = false;
 static unsigned long         fyLastSerialHeartbeat = 0;
 #define FY_SERIAL_TIMEOUT_MS 5000
 
+// Deferred companion mode switch — BLE callbacks set this flag,
+// loop() applies the WiFi/scan changes in the Arduino task context.
+static volatile bool         fyCompanionChangePending = false;
+
 // Phone GPS state (updated via browser Geolocation API -> /api/gps)
 static double fyGPSLat = 0;
 static double fyGPSLon = 0;
@@ -385,21 +389,16 @@ static int fyAddDetection(const char* mac, const char* name, int rssi,
 // BLE GATT SERVER (DeFlock companion connectivity)
 // ============================================================================
 
-// Forward declaration
-static void fyOnCompanionChange();
-
 class FYServerCallbacks : public NimBLEServerCallbacks {
     void onConnect(NimBLEServer* pServer, ble_gap_conn_desc* desc) override {
         fyBLEClientConnected = true;
-        printf("[FLOCK-YOU] BLE client connected\n");
-        fyOnCompanionChange();
+        fyCompanionChangePending = true;
     }
     void onDisconnect(NimBLEServer* pServer, ble_gap_conn_desc* desc) override {
         fyBLEClientConnected = false;
         fyNegotiatedMTU = 23;
-        printf("[FLOCK-YOU] BLE client disconnected\n");
         NimBLEDevice::startAdvertising();
-        fyOnCompanionChange();
+        fyCompanionChangePending = true;
     }
     void onMTUChange(uint16_t mtu, ble_gap_conn_desc* desc) override {
         fyNegotiatedMTU = mtu;
@@ -1078,13 +1077,17 @@ void loop() {
         fyLastSerialHeartbeat = millis();
         if (!fySerialHostConnected) {
             fySerialHostConnected = true;
-            printf("[FLOCK-YOU] Serial host connected\n");
-            fyOnCompanionChange();
+            fyCompanionChangePending = true;
         }
     } else if (fySerialHostConnected &&
                millis() - fyLastSerialHeartbeat >= FY_SERIAL_TIMEOUT_MS) {
         fySerialHostConnected = false;
-        printf("[FLOCK-YOU] Serial host disconnected (timeout)\n");
+        fyCompanionChangePending = true;
+    }
+
+    // Apply deferred companion mode switch (from BLE callbacks or serial detection)
+    if (fyCompanionChangePending) {
+        fyCompanionChangePending = false;
         fyOnCompanionChange();
     }
 
