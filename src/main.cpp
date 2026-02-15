@@ -43,9 +43,9 @@
 #define DETECT_BEEP_DURATION 150
 #define HEARTBEAT_DURATION 100
 
-// BLE scanning
-#define BLE_SCAN_DURATION 2      // seconds per scan
-#define BLE_SCAN_INTERVAL 3000   // ms between scans
+// BLE scanning (mutable — companion mode increases scan duty cycle)
+static int fyBleScanDuration = 2;              // seconds per scan
+static unsigned long fyBleScanInterval = 3000; // ms between scans
 
 // Detection storage
 #define MAX_DETECTIONS 200
@@ -162,6 +162,23 @@ static unsigned long fyLastDetTime = 0;
 static unsigned long fyLastHB = 0;
 static NimBLEScan* fyBLEScan = NULL;
 static AsyncWebServer fyServer(80);
+
+// BLE GATT server (DeFlock app connectivity)
+#define FY_SERVICE_UUID     "a1b2c3d4-e5f6-7890-abcd-ef0123456789"
+#define FY_TX_CHAR_UUID     "a1b2c3d4-e5f6-7890-abcd-ef01234567aa"
+static NimBLEServer*         fyBLEServer = NULL;
+static NimBLECharacteristic* fyTxChar    = NULL;
+static volatile bool         fyBLEClientConnected = false;
+static volatile uint16_t     fyNegotiatedMTU = 23;
+
+// Serial host detection (USB heartbeat from DeFlock desktop)
+static volatile bool         fySerialHostConnected = false;
+static unsigned long         fyLastSerialHeartbeat = 0;
+#define FY_SERIAL_TIMEOUT_MS 5000
+
+// Deferred companion mode switch — BLE callbacks set this flag,
+// loop() applies the WiFi/scan changes in the Arduino task context.
+static volatile bool         fyCompanionChangePending = false;
 
 // Phone GPS state (updated via browser Geolocation API -> /api/gps)
 static double fyGPSLat = 0;
@@ -400,6 +417,69 @@ static int fyAddDetection(const char* mac, const char* name, int rssi,
 }
 
 // ============================================================================
+// BLE GATT SERVER (DeFlock companion connectivity)
+// ============================================================================
+
+class FYServerCallbacks : public NimBLEServerCallbacks {
+    void onConnect(NimBLEServer* pServer, ble_gap_conn_desc* desc) override {
+        fyBLEClientConnected = true;
+        fyCompanionChangePending = true;
+    }
+    void onDisconnect(NimBLEServer* pServer, ble_gap_conn_desc* desc) override {
+        fyBLEClientConnected = false;
+        fyNegotiatedMTU = 23;
+        NimBLEDevice::startAdvertising();
+        fyCompanionChangePending = true;
+    }
+    void onMTUChange(uint16_t mtu, ble_gap_conn_desc* desc) override {
+        fyNegotiatedMTU = mtu;
+        printf("[FLOCK-YOU] MTU negotiated: %u\n", mtu);
+    }
+};
+
+static void fySendBLE(const char* data, size_t len) {
+    if (!fyBLEClientConnected || !fyTxChar) return;
+    uint16_t chunkSize = fyNegotiatedMTU - 3;
+    if (chunkSize < 1) chunkSize = 1;
+    if (len <= chunkSize) {
+        fyTxChar->setValue((const uint8_t*)data, len);
+        fyTxChar->notify();
+    } else {
+        size_t offset = 0;
+        while (offset < len) {
+            size_t remaining = len - offset;
+            size_t send = remaining < chunkSize ? remaining : chunkSize;
+            fyTxChar->setValue((const uint8_t*)(data + offset), send);
+            fyTxChar->notify();
+            offset += send;
+        }
+    }
+}
+
+// ============================================================================
+// COMPANION MODE (WiFi AP vs BLE/serial)
+// ============================================================================
+
+static void fyOnCompanionChange() {
+    if (fyBLEClientConnected || fySerialHostConnected) {
+        // Companion mode — disable WiFi AP, boost BLE scanning
+        WiFi.softAPdisconnect(true);
+        WiFi.mode(WIFI_OFF);
+        fyBleScanDuration = 3;
+        printf("[FLOCK-YOU] Companion mode: WiFi AP OFF, scan duration %ds\n",
+               fyBleScanDuration);
+    } else {
+        // Standalone mode — re-enable WiFi AP and web dashboard
+        WiFi.mode(WIFI_AP);
+        delay(100);
+        WiFi.softAP(FY_AP_SSID, FY_AP_PASS);
+        fyBleScanDuration = 2;
+        printf("[FLOCK-YOU] Standalone mode: WiFi AP ON (%s), scan duration %ds\n",
+               FY_AP_SSID, fyBleScanDuration);
+    }
+}
+
+// ============================================================================
 // BLE SCANNING
 // ============================================================================
 
@@ -482,24 +562,26 @@ class FYBLECallbacks : public NimBLEAdvertisedDeviceCallbacks {
                    addrStr.c_str(), name.c_str(), rssi, method,
                    idx >= 0 ? fyDet[idx].count : 0);
 
-            // JSON serial output (Flask-compatible format for live ingestion)
-            // Build GPS fragment if available
+            // JSON output — build into buffer for serial + BLE
             char gpsBuf[80] = "";
             if (fyGPSIsFresh()) {
                 snprintf(gpsBuf, sizeof(gpsBuf),
                     ",\"gps\":{\"latitude\":%.8f,\"longitude\":%.8f,\"accuracy\":%.1f}",
                     fyGPSLat, fyGPSLon, fyGPSAcc);
             }
-            if (isRaven) {
-                printf("{\"detection_method\":\"%s\",\"protocol\":\"bluetooth_le\","
-                       "\"mac_address\":\"%s\",\"device_name\":\"%s\","
-                       "\"rssi\":%d,\"is_raven\":true,\"raven_fw\":\"%s\"%s}\n",
-                       method, addrStr.c_str(), name.c_str(), rssi, ravenFW, gpsBuf);
-            } else {
-                printf("{\"detection_method\":\"%s\",\"protocol\":\"bluetooth_le\","
-                       "\"mac_address\":\"%s\",\"device_name\":\"%s\","
-                       "\"rssi\":%d%s}\n",
-                       method, addrStr.c_str(), name.c_str(), rssi, gpsBuf);
+            char jsonBuf[512];
+            int jsonLen = snprintf(jsonBuf, sizeof(jsonBuf),
+                "{\"event\":\"detection\",\"detection_method\":\"%s\","
+                "\"protocol\":\"bluetooth_le\",\"mac_address\":\"%s\","
+                "\"device_name\":\"%s\",\"rssi\":%d,"
+                "\"is_raven\":%s,\"raven_fw\":\"%s\"%s}",
+                method, addrStr.c_str(), name.c_str(), rssi,
+                isRaven ? "true" : "false", isRaven ? ravenFW : "", gpsBuf);
+            printf("%s\n", jsonBuf);
+            // Append newline for BLE framing and send
+            if (jsonLen > 0 && jsonLen < (int)sizeof(jsonBuf) - 1) {
+                jsonBuf[jsonLen] = '\n';
+                fySendBLE(jsonBuf, jsonLen + 1);
             }
 
             if (!fyTriggered && highConfidence) {
@@ -1028,8 +1110,11 @@ void setup() {
     printf("  Buzzer: %s\n", fyBuzzerOn ? "ON" : "OFF");
     printf("========================================\n");
 
-    // Init BLE scanner FIRST -- start scanning immediately
-    NimBLEDevice::init("");
+    // Init BLE with device name and large MTU for GATT notifications
+    NimBLEDevice::init("flockyou");
+    NimBLEDevice::setMTU(512);
+
+    // BLE scanner setup
     fyBLEScan = NimBLEDevice::getScan();
     fyBLEScan->setAdvertisedDeviceCallbacks(new FYBLECallbacks());
     fyBLEScan->setActiveScan(true);
@@ -1037,9 +1122,26 @@ void setup() {
     fyBLEScan->setWindow(99);
 
     // Kick off the first scan right away
-    fyBLEScan->start(BLE_SCAN_DURATION, false);
+    fyBLEScan->start(fyBleScanDuration, false);
     fyLastBleScan = millis();
     printf("[FLOCK-YOU] BLE scanning ACTIVE\n");
+
+    // BLE GATT server — DeFlock app connectivity
+    fyBLEServer = NimBLEDevice::createServer();
+    fyBLEServer->setCallbacks(new FYServerCallbacks());
+    NimBLEService* pService = fyBLEServer->createService(FY_SERVICE_UUID);
+    fyTxChar = pService->createCharacteristic(
+        FY_TX_CHAR_UUID,
+        NIMBLE_PROPERTY::NOTIFY
+    );
+    pService->start();
+
+    NimBLEAdvertising* pAdv = NimBLEDevice::getAdvertising();
+    pAdv->addServiceUUID(FY_SERVICE_UUID);
+    pAdv->setName("flockyou");
+    pAdv->setScanResponse(true);
+    pAdv->start();
+    printf("[FLOCK-YOU] BLE GATT server advertising (service %s)\n", FY_SERVICE_UUID);
 
     // Crow calls play WHILE BLE is already scanning
     fyBootBeep();
@@ -1056,17 +1158,37 @@ void setup() {
 
     printf("[FLOCK-YOU] Detection methods: MAC prefix, device name, manufacturer ID, Raven UUID\n");
     printf("[FLOCK-YOU] Dashboard: http://192.168.4.1\n");
-    printf("[FLOCK-YOU] Ready - no WiFi connection needed, BLE + AP only\n\n");
+    printf("[FLOCK-YOU] Ready - BLE GATT + AP mode\n\n");
 }
 
 void loop() {
+    // Serial host detection (heartbeat from DeFlock desktop app)
+    if (Serial.available()) {
+        while (Serial.available()) Serial.read();  // drain buffer
+        fyLastSerialHeartbeat = millis();
+        if (!fySerialHostConnected) {
+            fySerialHostConnected = true;
+            fyCompanionChangePending = true;
+        }
+    } else if (fySerialHostConnected &&
+               millis() - fyLastSerialHeartbeat >= FY_SERIAL_TIMEOUT_MS) {
+        fySerialHostConnected = false;
+        fyCompanionChangePending = true;
+    }
+
+    // Apply deferred companion mode switch (from BLE callbacks or serial detection)
+    if (fyCompanionChangePending) {
+        fyCompanionChangePending = false;
+        fyOnCompanionChange();
+    }
+
     // BLE scanning cycle
-    if (millis() - fyLastBleScan >= BLE_SCAN_INTERVAL && !fyBLEScan->isScanning()) {
-        fyBLEScan->start(BLE_SCAN_DURATION, false);
+    if (millis() - fyLastBleScan >= fyBleScanInterval && !fyBLEScan->isScanning()) {
+        fyBLEScan->start(fyBleScanDuration, false);
         fyLastBleScan = millis();
     }
 
-    if (!fyBLEScan->isScanning() && millis() - fyLastBleScan > BLE_SCAN_DURATION * 1000) {
+    if (!fyBLEScan->isScanning() && millis() - fyLastBleScan > (unsigned long)fyBleScanDuration * 1000) {
         fyBLEScan->clearResults();
     }
 
