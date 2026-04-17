@@ -148,7 +148,8 @@ struct FYDetection {
 
 static FYDetection fyDet[MAX_DETECTIONS];
 static int fyDetCount = 0;
-static SemaphoreHandle_t fyMutex = NULL;
+static SemaphoreHandle_t fyMutex = NULL;      // guards fyDet[] + fyDetCount
+static SemaphoreHandle_t fyGPSMutex = NULL;   // guards fyGPS* globals
 
 // ============================================================================
 // GLOBALS
@@ -346,20 +347,81 @@ static const char* estimateRavenFW(NimBLEAdvertisedDevice* device) {
 }
 
 // ============================================================================
-// GPS HELPERS
+// GPS HELPERS (mutex-protected snapshot pattern)
 // ============================================================================
 
+// Fast advisory check — safe lock-free (for UI/stats only, don't trust for writes)
 static bool fyGPSIsFresh() {
     return fyGPSValid && (millis() - fyGPSLastUpdate < GPS_STALE_MS);
 }
 
+// Atomic snapshot: returns true and fills out-params if GPS is fresh & valid.
+// Safe to call from BLE callback context — never races with producer.
+static bool fyGPSSnapshot(double& lat, double& lon, float& acc) {
+    if (!fyGPSMutex) return false;
+    if (xSemaphoreTake(fyGPSMutex, pdMS_TO_TICKS(20)) != pdTRUE) return false;
+    bool fresh = fyGPSValid && (millis() - fyGPSLastUpdate < GPS_STALE_MS);
+    if (fresh) { lat = fyGPSLat; lon = fyGPSLon; acc = fyGPSAcc; }
+    xSemaphoreGive(fyGPSMutex);
+    return fresh;
+}
+
+// Atomic GPS publish (from phone via /api/gps or from companion app)
+static void fyGPSUpdate(double lat, double lon, float acc) {
+    if (!fyGPSMutex) return;
+    if (xSemaphoreTake(fyGPSMutex, pdMS_TO_TICKS(20)) != pdTRUE) return;
+    fyGPSLat = lat;
+    fyGPSLon = lon;
+    fyGPSAcc = acc;
+    fyGPSValid = true;
+    fyGPSLastUpdate = millis();
+    xSemaphoreGive(fyGPSMutex);
+}
+
+// Stamp a detection with current GPS if available (used at first-sight and re-sight)
 static void fyAttachGPS(FYDetection& d) {
-    if (fyGPSIsFresh()) {
+    double lat, lon;
+    float acc;
+    if (fyGPSSnapshot(lat, lon, acc)) {
         d.hasGPS = true;
-        d.gpsLat = fyGPSLat;
-        d.gpsLon = fyGPSLon;
-        d.gpsAcc = fyGPSAcc;
+        d.gpsLat = lat;
+        d.gpsLon = lon;
+        d.gpsAcc = acc;
     }
+}
+
+// Periodic: back-fill GPS on detections recorded before a fix was available.
+// Runs in main loop — MUST NOT be called from BLE callback (takes fyMutex).
+static void fyBackfillGPS() {
+    double lat, lon;
+    float acc;
+    if (!fyGPSSnapshot(lat, lon, acc)) return;
+    if (!fyMutex || xSemaphoreTake(fyMutex, pdMS_TO_TICKS(50)) != pdTRUE) return;
+    int filled = 0;
+    for (int i = 0; i < fyDetCount; i++) {
+        if (!fyDet[i].hasGPS) {
+            fyDet[i].hasGPS = true;
+            fyDet[i].gpsLat = lat;
+            fyDet[i].gpsLon = lon;
+            fyDet[i].gpsAcc = acc;
+            filled++;
+        }
+    }
+    xSemaphoreGive(fyMutex);
+    if (filled) printf("[FLOCK-YOU] GPS backfilled %d detection(s)\n", filled);
+}
+
+// ============================================================================
+// CRC32 (IEEE 802.3) — for session file integrity
+// ============================================================================
+
+static uint32_t fyCRC32Update(uint32_t crc, const uint8_t* data, size_t len) {
+    crc = ~crc;
+    while (len--) {
+        crc ^= *data++;
+        for (int k = 0; k < 8; k++) crc = (crc >> 1) ^ (0xEDB88320UL & -(crc & 1));
+    }
+    return ~crc;
 }
 
 // ============================================================================
@@ -563,11 +625,15 @@ class FYBLECallbacks : public NimBLEAdvertisedDeviceCallbacks {
                    idx >= 0 ? fyDet[idx].count : 0);
 
             // JSON output — build into buffer for serial + BLE
+            // Use atomic snapshot to avoid races with /api/gps writer
             char gpsBuf[80] = "";
-            if (fyGPSIsFresh()) {
-                snprintf(gpsBuf, sizeof(gpsBuf),
-                    ",\"gps\":{\"latitude\":%.8f,\"longitude\":%.8f,\"accuracy\":%.1f}",
-                    fyGPSLat, fyGPSLon, fyGPSAcc);
+            {
+                double sLat, sLon; float sAcc;
+                if (fyGPSSnapshot(sLat, sLon, sAcc)) {
+                    snprintf(gpsBuf, sizeof(gpsBuf),
+                        ",\"gps\":{\"latitude\":%.8f,\"longitude\":%.8f,\"accuracy\":%.1f}",
+                        sLat, sLon, sAcc);
+                }
             }
             char jsonBuf[512];
             int jsonLen = snprintf(jsonBuf, sizeof(jsonBuf),
@@ -603,7 +669,7 @@ class FYBLECallbacks : public NimBLEAdvertisedDeviceCallbacks {
 
 static void writeDetectionsJSON(AsyncResponseStream *resp) {
     resp->print("[");
-    if (fyMutex && xSemaphoreTake(fyMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+    if (fyMutex && xSemaphoreTake(fyMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
         for (int i = 0; i < fyDetCount; i++) {
             if (i > 0) resp->print(",");
             resp->printf(
@@ -626,73 +692,248 @@ static void writeDetectionsJSON(AsyncResponseStream *resp) {
 }
 
 // ============================================================================
-// SESSION PERSISTENCE (SPIFFS)
+// SESSION PERSISTENCE (SPIFFS) — bulletproof envelope format
 // ============================================================================
+//
+// Wire format on disk:
+//   Line 1: {"v":1,"count":N,"bytes":B,"crc":"0xXXXXXXXX"}\n
+//   Line 2+: [{"mac":...},{"mac":...},...]    (exactly B bytes, CRC32 == X)
+//
+// Atomic write procedure:
+//   1. Compute size+CRC over the detections payload (pass 1, under fyMutex)
+//   2. Write envelope header + payload to /session.tmp (pass 2, under same lock)
+//   3. Remove /session.json
+//   4. Rename /session.tmp → /session.json (with copy+delete fallback)
+//
+// Recovery: if /session.json is missing or CRC-invalid, fall back to /session.tmp.
+
+#define FY_SESSION_TMP "/session.tmp"
+
+// Serialize a single detection to `dst`. Returns bytes written (0 on overflow).
+static size_t fySerializeDet(const FYDetection& d, char* dst, size_t cap) {
+    int n;
+    if (d.hasGPS) {
+        n = snprintf(dst, cap,
+            "{\"mac\":\"%s\",\"name\":\"%s\",\"rssi\":%d,\"method\":\"%s\","
+            "\"first\":%lu,\"last\":%lu,\"count\":%d,"
+            "\"raven\":%s,\"fw\":\"%s\","
+            "\"gps\":{\"lat\":%.8f,\"lon\":%.8f,\"acc\":%.1f}}",
+            d.mac, d.name, d.rssi, d.method,
+            d.firstSeen, d.lastSeen, d.count,
+            d.isRaven ? "true" : "false", d.ravenFW,
+            d.gpsLat, d.gpsLon, d.gpsAcc);
+    } else {
+        n = snprintf(dst, cap,
+            "{\"mac\":\"%s\",\"name\":\"%s\",\"rssi\":%d,\"method\":\"%s\","
+            "\"first\":%lu,\"last\":%lu,\"count\":%d,"
+            "\"raven\":%s,\"fw\":\"%s\"}",
+            d.mac, d.name, d.rssi, d.method,
+            d.firstSeen, d.lastSeen, d.count,
+            d.isRaven ? "true" : "false", d.ravenFW);
+    }
+    return (n > 0 && (size_t)n < cap) ? (size_t)n : 0;
+}
+
+// Pass 1: compute exact payload size + CRC32 without allocating.
+// Caller MUST hold fyMutex.
+static uint32_t fyComputePayloadCRC(size_t& outBytes) {
+    char line[512];
+    uint32_t crc = 0;
+    outBytes = 0;
+    crc = fyCRC32Update(crc, (const uint8_t*)"[", 1); outBytes += 1;
+    for (int i = 0; i < fyDetCount; i++) {
+        if (i > 0) { crc = fyCRC32Update(crc, (const uint8_t*)",", 1); outBytes += 1; }
+        size_t n = fySerializeDet(fyDet[i], line, sizeof(line));
+        if (n == 0) continue;
+        crc = fyCRC32Update(crc, (const uint8_t*)line, n);
+        outBytes += n;
+    }
+    crc = fyCRC32Update(crc, (const uint8_t*)"]", 1); outBytes += 1;
+    return crc;
+}
+
+// Validate a session file envelope and its payload CRC. Returns true if intact.
+static bool fyValidateSessionFile(const char* path) {
+    if (!SPIFFS.exists(path)) return false;
+    File f = SPIFFS.open(path, "r");
+    if (!f) return false;
+
+    String hdr = f.readStringUntil('\n');
+    if (hdr.length() < 10 || hdr[0] != '{') { f.close(); return false; }
+
+    JsonDocument doc;
+    if (deserializeJson(doc, hdr) != DeserializationError::Ok) { f.close(); return false; }
+    if ((int)(doc["v"] | 0) != 1) { f.close(); return false; }
+    size_t expectedBytes = (size_t)(doc["bytes"] | 0);
+    uint32_t expectedCRC = 0;
+    const char* crcStr = doc["crc"] | "";
+    if (sscanf(crcStr, "%x", &expectedCRC) != 1) { f.close(); return false; }
+
+    size_t bodyOffset = hdr.length() + 1;
+    size_t fileSize = f.size();
+    if (fileSize < bodyOffset + expectedBytes) { f.close(); return false; }
+    size_t actualBytes = fileSize - bodyOffset;
+    if (actualBytes != expectedBytes) { f.close(); return false; }
+
+    uint8_t buf[256];
+    uint32_t crc = 0;
+    size_t remaining = expectedBytes;
+    while (remaining > 0) {
+        int n = f.read(buf, remaining < sizeof(buf) ? remaining : sizeof(buf));
+        if (n <= 0) break;
+        crc = fyCRC32Update(crc, buf, (size_t)n);
+        remaining -= (size_t)n;
+    }
+    f.close();
+    return (remaining == 0 && crc == expectedCRC);
+}
+
+// Copy src→dst in chunks. Returns true on success.
+static bool fySpiffsCopy(const char* src, const char* dst) {
+    File s = SPIFFS.open(src, "r");
+    if (!s) return false;
+    File d = SPIFFS.open(dst, "w");
+    if (!d) { s.close(); return false; }
+    uint8_t buf[256];
+    int n;
+    bool ok = true;
+    while ((n = s.read(buf, sizeof(buf))) > 0) {
+        if (d.write(buf, (size_t)n) != (size_t)n) { ok = false; break; }
+    }
+    s.close();
+    d.close();
+    return ok;
+}
+
+// Atomic rename: try SPIFFS rename first, fall back to copy+delete if rename fails.
+static bool fyAtomicPromote(const char* src, const char* dst) {
+    if (SPIFFS.rename(src, dst)) return true;
+    if (!fySpiffsCopy(src, dst)) return false;
+    SPIFFS.remove(src);
+    return true;
+}
 
 static void fySaveSession() {
     if (!fySpiffsReady || !fyMutex) return;
-    if (xSemaphoreTake(fyMutex, pdMS_TO_TICKS(300)) != pdTRUE) return;
-
-    File f = SPIFFS.open(FY_SESSION_FILE, "w");
-    if (!f) { xSemaphoreGive(fyMutex); return; }
-
-    f.print("[");
-    for (int i = 0; i < fyDetCount; i++) {
-        if (i > 0) f.print(",");
-        FYDetection& d = fyDet[i];
-        f.printf("{\"mac\":\"%s\",\"name\":\"%s\",\"rssi\":%d,\"method\":\"%s\","
-                 "\"first\":%lu,\"last\":%lu,\"count\":%d,"
-                 "\"raven\":%s,\"fw\":\"%s\"",
-                 d.mac, d.name, d.rssi, d.method,
-                 d.firstSeen, d.lastSeen, d.count,
-                 d.isRaven ? "true" : "false", d.ravenFW);
-        if (d.hasGPS) {
-            f.printf(",\"gps\":{\"lat\":%.8f,\"lon\":%.8f,\"acc\":%.1f}", d.gpsLat, d.gpsLon, d.gpsAcc);
-        }
-        f.print("}");
+    if (xSemaphoreTake(fyMutex, pdMS_TO_TICKS(500)) != pdTRUE) {
+        printf("[FLOCK-YOU] Save skipped: fyMutex busy\n");
+        return;
     }
-    f.print("]");
+
+    // Pass 1: compute CRC + byte count
+    size_t payloadBytes = 0;
+    uint32_t crc = fyComputePayloadCRC(payloadBytes);
+    int savedCount = fyDetCount;
+
+    // Pass 2: write envelope + payload to tmp
+    File f = SPIFFS.open(FY_SESSION_TMP, "w");
+    if (!f) {
+        xSemaphoreGive(fyMutex);
+        printf("[FLOCK-YOU] Save failed: cannot open %s\n", FY_SESSION_TMP);
+        return;
+    }
+    f.printf("{\"v\":1,\"count\":%d,\"bytes\":%u,\"crc\":\"0x%08lX\"}\n",
+             savedCount, (unsigned)payloadBytes, (unsigned long)crc);
+
+    char line[512];
+    size_t wrote = 0;
+    f.write((uint8_t*)"[", 1); wrote++;
+    for (int i = 0; i < fyDetCount; i++) {
+        if (i > 0) { f.write((uint8_t*)",", 1); wrote++; }
+        size_t n = fySerializeDet(fyDet[i], line, sizeof(line));
+        if (n == 0) continue;
+        f.write((uint8_t*)line, n);
+        wrote += n;
+    }
+    f.write((uint8_t*)"]", 1); wrote++;
     f.close();
-    fyLastSaveCount = fyDetCount;
-    printf("[FLOCK-YOU] Session saved: %d detections\n", fyDetCount);
     xSemaphoreGive(fyMutex);
+
+    if (wrote != payloadBytes) {
+        printf("[FLOCK-YOU] Save WARNING: wrote %u expected %u — aborting promote\n",
+               (unsigned)wrote, (unsigned)payloadBytes);
+        return;
+    }
+
+    if (!fyValidateSessionFile(FY_SESSION_TMP)) {
+        printf("[FLOCK-YOU] Save verify FAILED — aborting promote (old session preserved)\n");
+        return;
+    }
+
+    SPIFFS.remove(FY_SESSION_FILE);
+    if (!fyAtomicPromote(FY_SESSION_TMP, FY_SESSION_FILE)) {
+        printf("[FLOCK-YOU] Promote FAILED — data in %s for recovery\n", FY_SESSION_TMP);
+        return;
+    }
+
+    fyLastSaveCount = savedCount;
+    printf("[FLOCK-YOU] Session saved: %d det, %u bytes, crc=0x%08lX\n",
+           savedCount, (unsigned)payloadBytes, (unsigned long)crc);
 }
 
 static void fyPromotePrevSession() {
-    // Copy current session to prev_session on boot, then delete original
-    // NOTE: SPIFFS.rename() is unreliable on ESP32 — use copy+delete instead
     if (!fySpiffsReady) return;
-    if (!SPIFFS.exists(FY_SESSION_FILE)) {
-        printf("[FLOCK-YOU] No prior session file to promote\n");
+
+    const char* source = nullptr;
+    if (fyValidateSessionFile(FY_SESSION_FILE)) {
+        source = FY_SESSION_FILE;
+    } else if (fyValidateSessionFile(FY_SESSION_TMP)) {
+        printf("[FLOCK-YOU] Main session corrupt/missing — recovering from tmp\n");
+        source = FY_SESSION_TMP;
+    } else {
+        // Legacy fallback: old format (raw array, no envelope)
+        if (SPIFFS.exists(FY_SESSION_FILE)) {
+            File f = SPIFFS.open(FY_SESSION_FILE, "r");
+            if (f && f.size() > 2) {
+                int first = f.peek();
+                f.close();
+                if (first == '[') {
+                    source = FY_SESSION_FILE;
+                    printf("[FLOCK-YOU] Legacy-format session detected — promoting\n");
+                }
+            } else if (f) { f.close(); }
+        }
+    }
+
+    if (!source) {
+        if (SPIFFS.exists(FY_SESSION_FILE)) SPIFFS.remove(FY_SESSION_FILE);
+        if (SPIFFS.exists(FY_SESSION_TMP))  SPIFFS.remove(FY_SESSION_TMP);
+        printf("[FLOCK-YOU] No valid prior session to promote\n");
         return;
     }
 
-    File src = SPIFFS.open(FY_SESSION_FILE, "r");
-    if (!src) {
-        printf("[FLOCK-YOU] Failed to open session file for promotion\n");
-        return;
-    }
-    String data = src.readString();
-    src.close();
-
-    if (data.length() == 0) {
-        printf("[FLOCK-YOU] Session file empty, skipping promotion\n");
-        SPIFFS.remove(FY_SESSION_FILE);
+    if (!fySpiffsCopy(source, FY_PREV_FILE)) {
+        printf("[FLOCK-YOU] Failed to promote %s → %s\n", source, FY_PREV_FILE);
         return;
     }
 
-    // Write to prev_session (overwrite any existing)
-    File dst = SPIFFS.open(FY_PREV_FILE, "w");
-    if (!dst) {
-        printf("[FLOCK-YOU] Failed to create prev_session file\n");
-        return;
-    }
-    dst.print(data);
-    dst.close();
+    if (SPIFFS.exists(FY_SESSION_FILE)) SPIFFS.remove(FY_SESSION_FILE);
+    if (SPIFFS.exists(FY_SESSION_TMP))  SPIFFS.remove(FY_SESSION_TMP);
 
-    // Delete the old session file so it doesn't get re-promoted next boot
-    SPIFFS.remove(FY_SESSION_FILE);
-    printf("[FLOCK-YOU] Prior session promoted: %d bytes\n", data.length());
+    File v = SPIFFS.open(FY_PREV_FILE, "r");
+    size_t sz = v ? v.size() : 0;
+    if (v) v.close();
+    printf("[FLOCK-YOU] Prior session promoted from %s (%u bytes)\n", source, (unsigned)sz);
+}
+
+// Read prev_session as a raw detection JSON array (strips envelope header if present).
+static void fyStreamPrevSessionBody(AsyncResponseStream* resp) {
+    if (!fySpiffsReady || !SPIFFS.exists(FY_PREV_FILE)) { resp->print("[]"); return; }
+    File f = SPIFFS.open(FY_PREV_FILE, "r");
+    if (!f) { resp->print("[]"); return; }
+
+    int first = f.peek();
+    if (first == '{') f.readStringUntil('\n');
+
+    uint8_t buf[256];
+    int n;
+    size_t streamed = 0;
+    while ((n = f.read(buf, sizeof(buf))) > 0) {
+        resp->write(buf, (size_t)n);
+        streamed += (size_t)n;
+    }
+    f.close();
+    if (streamed == 0) resp->print("[]");
 }
 
 // ============================================================================
@@ -711,7 +952,7 @@ static void writeDetectionsKML(AsyncResponseStream *resp) {
                 "<Style id=\"raven\"><IconStyle><color>ff4444ef</color>"
                 "<scale>1.2</scale></IconStyle></Style>\n");
 
-    if (fyMutex && xSemaphoreTake(fyMutex, pdMS_TO_TICKS(300)) == pdTRUE) {
+    if (fyMutex && xSemaphoreTake(fyMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
         for (int i = 0; i < fyDetCount; i++) {
             FYDetection& d = fyDet[i];
             if (!d.hasGPS) continue;  // Skip detections without GPS
@@ -892,14 +1133,13 @@ static void fySetupServer() {
         r->send(200, "application/json", buf);
     });
 
-    // API: Receive GPS from phone browser
+    // API: Receive GPS from phone browser (atomic publish under fyGPSMutex)
     fyServer.on("/api/gps", HTTP_GET, [](AsyncWebServerRequest *r) {
         if (r->hasParam("lat") && r->hasParam("lon")) {
-            fyGPSLat = r->getParam("lat")->value().toDouble();
-            fyGPSLon = r->getParam("lon")->value().toDouble();
-            fyGPSAcc = r->hasParam("acc") ? r->getParam("acc")->value().toFloat() : 0;
-            fyGPSValid = true;
-            fyGPSLastUpdate = millis();
+            double lat = r->getParam("lat")->value().toDouble();
+            double lon = r->getParam("lon")->value().toDouble();
+            float  acc = r->hasParam("acc") ? r->getParam("acc")->value().toFloat() : 0;
+            fyGPSUpdate(lat, lon, acc);
             r->send(200, "application/json", "{\"status\":\"ok\"}");
         } else {
             r->send(400, "application/json", "{\"error\":\"lat,lon required\"}");
@@ -956,7 +1196,7 @@ static void fySetupServer() {
         AsyncResponseStream *resp = r->beginResponseStream("text/csv");
         resp->addHeader("Content-Disposition", "attachment; filename=\"flockyou_detections.csv\"");
         resp->println("mac,name,rssi,method,first_seen_ms,last_seen_ms,count,is_raven,raven_fw,latitude,longitude,gps_accuracy");
-        if (fyMutex && xSemaphoreTake(fyMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+        if (fyMutex && xSemaphoreTake(fyMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
             for (int i = 0; i < fyDetCount; i++) {
                 FYDetection& d = fyDet[i];
                 if (d.hasGPS) {
@@ -985,27 +1225,27 @@ static void fySetupServer() {
         r->send(resp);
     });
 
-    // API: Prior session history (JSON)
+    // API: Prior session history (JSON) — strips envelope header if present
     fyServer.on("/api/history", HTTP_GET, [](AsyncWebServerRequest *r) {
-        if (fySpiffsReady && SPIFFS.exists(FY_PREV_FILE)) {
-            r->send(SPIFFS, FY_PREV_FILE, "application/json");
-        } else {
-            r->send(200, "application/json", "[]");
-        }
+        AsyncResponseStream *resp = r->beginResponseStream("application/json");
+        fyStreamPrevSessionBody(resp);
+        r->send(resp);
     });
 
-    // API: Download prior session as JSON file
+    // API: Download prior session as JSON file (body-only, envelope stripped)
     fyServer.on("/api/history/json", HTTP_GET, [](AsyncWebServerRequest *r) {
-        if (fySpiffsReady && SPIFFS.exists(FY_PREV_FILE)) {
-            AsyncWebServerResponse *resp = r->beginResponse(SPIFFS, FY_PREV_FILE, "application/json");
-            resp->addHeader("Content-Disposition", "attachment; filename=\"flockyou_prev_session.json\"");
-            r->send(resp);
-        } else {
+        if (!fySpiffsReady || !SPIFFS.exists(FY_PREV_FILE)) {
             r->send(404, "application/json", "{\"error\":\"no prior session\"}");
+            return;
         }
+        AsyncResponseStream *resp = r->beginResponseStream("application/json");
+        resp->addHeader("Content-Disposition",
+            "attachment; filename=\"flockyou_prev_session.json\"");
+        fyStreamPrevSessionBody(resp);
+        r->send(resp);
     });
 
-    // API: Download prior session as KML (reads JSON from SPIFFS, converts)
+    // API: Download prior session as KML (reads JSON body from SPIFFS, converts)
     fyServer.on("/api/history/kml", HTTP_GET, [](AsyncWebServerRequest *r) {
         if (!fySpiffsReady || !SPIFFS.exists(FY_PREV_FILE)) {
             r->send(404, "application/json", "{\"error\":\"no prior session\"}");
@@ -1013,6 +1253,8 @@ static void fySetupServer() {
         }
         File f = SPIFFS.open(FY_PREV_FILE, "r");
         if (!f) { r->send(500, "text/plain", "read error"); return; }
+        // Strip envelope header if present
+        if (f.peek() == '{') f.readStringUntil('\n');
         String content = f.readString();
         f.close();
         if (content.length() == 0) {
@@ -1093,7 +1335,8 @@ void setup() {
     pinMode(BUZZER_PIN, OUTPUT);
     digitalWrite(BUZZER_PIN, LOW);
 
-    fyMutex = xSemaphoreCreateMutex();
+    fyMutex    = xSemaphoreCreateMutex();
+    fyGPSMutex = xSemaphoreCreateMutex();
 
     // Init SPIFFS for session persistence
     if (SPIFFS.begin(true)) {
@@ -1205,18 +1448,28 @@ void loop() {
         }
     }
 
-    // Auto-save session to SPIFFS every 15s if detections changed
-    // Also triggers an early save 5s after first detection to minimize loss on power-cycle
-    if (fySpiffsReady && millis() - fyLastSave >= FY_SAVE_INTERVAL) {
-        if (fyDetCount > 0 && fyDetCount != fyLastSaveCount) {
+    // Back-fill GPS on any detections captured before the first fix (every 2s)
+    static unsigned long lastBackfill = 0;
+    if (millis() - lastBackfill >= 2000) {
+        fyBackfillGPS();
+        lastBackfill = millis();
+    }
+
+    // Bulletproof save cadence:
+    //  - within 5s of first detection (quick first-save)
+    //  - any time fyDetCount increases (new unique device), throttled to 3s minimum
+    //  - every FY_SAVE_INTERVAL (15s) as a safety net
+    if (fySpiffsReady && fyDetCount > 0) {
+        unsigned long now = millis();
+        bool countChanged = (fyDetCount != fyLastSaveCount);
+        bool minGap       = (now - fyLastSave >= 3000);
+        bool firstSave    = (fyLastSaveCount == 0 && now - fyLastSave >= 5000);
+        bool periodic     = (now - fyLastSave >= FY_SAVE_INTERVAL);
+
+        if (firstSave || (countChanged && minGap) || periodic) {
             fySaveSession();
+            fyLastSave = millis();
         }
-        fyLastSave = millis();
-    } else if (fySpiffsReady && fyDetCount > 0 && fyLastSaveCount == 0 &&
-               millis() - fyLastSave >= 5000) {
-        // Quick first-save: persist within 5s of first detection
-        fySaveSession();
-        fyLastSave = millis();
     }
 
     delay(100);
