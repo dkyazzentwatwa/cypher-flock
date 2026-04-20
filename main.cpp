@@ -41,6 +41,19 @@ static const size_t  fullHopChannelCount = sizeof(fullHopChannels) / sizeof(full
 #define RSSI_MIN        -95
 #define ALERT_COOLDOWN_MS 5000
 
+// Audio cadence: two fast ascending beeps on a NEW MAC, then while any
+// target is still in range (seen within HB_DEVICE_ACTIVE_MS), two monotone
+// heartbeat beeps every HB_BEEP_INTERVAL_MS.
+#define HB_DEVICE_ACTIVE_MS    20000
+#define HB_BEEP_INTERVAL_MS    10000
+#define NEW_CHIRP_LO_HZ        2000
+#define NEW_CHIRP_HI_HZ        2800
+#define NEW_CHIRP_NOTE_MS      55
+#define NEW_CHIRP_GAP_MS       25
+#define HB_BEEP_HZ             1500
+#define HB_BEEP_NOTE_MS        70
+#define HB_BEEP_GAP_MS         70
+
 #define ENABLE_SSID_MATCH 0
 #define CHECK_ADDR1 1   // dst/rx — catches Flock STAs receiving probe responses
 #define CHECK_ADDR3 0   // bssid fallback for randomised addr2
@@ -181,6 +194,12 @@ static size_t dedupeIdx = 0;
 // LED one-shot pulse timer
 static volatile unsigned long ledOffAt = 0;
 
+// Heartbeat audio state: last time any target was seen, last time the
+// heartbeat beep-pair was played. When nothing has been seen for
+// HB_DEVICE_ACTIVE_MS the heartbeat stops until the next new detection.
+static unsigned long fyLastTargetSeen  = 0;
+static unsigned long fyLastHeartbeatAt = 0;
+
 // ============================================================
 // 802.11 HEADER
 // ============================================================
@@ -252,6 +271,25 @@ static void ledTick() {
 static void buzzerBeep(unsigned int ms) {
 #if USE_BUZZER
   digitalWrite(BUZZER_PIN, HIGH); delay(ms); digitalWrite(BUZZER_PIN, LOW);
+#endif
+}
+
+// Two fast ascending beeps — played on the FIRST sighting of a MAC.
+static void newDetectChirp() {
+#if USE_BUZZER
+  tone(BUZZER_PIN, NEW_CHIRP_LO_HZ); delay(NEW_CHIRP_NOTE_MS); noTone(BUZZER_PIN);
+  delay(NEW_CHIRP_GAP_MS);
+  tone(BUZZER_PIN, NEW_CHIRP_HI_HZ); delay(NEW_CHIRP_NOTE_MS); noTone(BUZZER_PIN);
+#endif
+}
+
+// Two monotone beeps — periodic heartbeat while at least one target is still
+// in range (last seen within HB_DEVICE_ACTIVE_MS).
+static void heartbeatBeep() {
+#if USE_BUZZER
+  tone(BUZZER_PIN, HB_BEEP_HZ); delay(HB_BEEP_NOTE_MS); noTone(BUZZER_PIN);
+  delay(HB_BEEP_GAP_MS);
+  tone(BUZZER_PIN, HB_BEEP_HZ); delay(HB_BEEP_NOTE_MS); noTone(BUZZER_PIN);
 #endif
 }
 static void startupBeep() {
@@ -853,6 +891,14 @@ static void drainAlertQueue() {
     int idx = fyAddDetection(macStr, method, e.rssi, e.channel,
                              (e.type == ALERT_SSID) ? e.ssid : nullptr);
 
+    // A MAC is "new" iff fyAddDetection just inserted it (count is exactly 1).
+    bool isNew = (idx >= 0 && fyDet[idx].count == 1);
+
+    // Refresh the global "still around" timer for the heartbeat tick.
+    // Done unconditionally so a device counts as active even when serial is
+    // rate-limited (still audible via heartbeat, just quieter on the wire).
+    fyLastTargetSeen = millis();
+
     // Serial-rate-limit: suppress emit/beep/flash within ALERT_COOLDOWN_MS.
     if (shouldSuppressDuplicate(macStr)) continue;
 
@@ -874,8 +920,16 @@ static void drainAlertQueue() {
     emitDetectionJSON(macStr, method, e.rssi, e.channel,
                       (e.type == ALERT_SSID) ? e.ssid : "");
 
-    // Beep + LED flash on every emitted detection.
-    buzzerBeep(60);
+    // Audio feedback:
+    //   - NEW MAC  → two fast ascending beeps (clearly distinct sound)
+    //   - REPEAT   → silent; the heartbeat tick covers continued presence
+    // LED flashes on every emitted detection either way.
+    if (isNew) {
+      newDetectChirp();
+      // Reset the heartbeat phase so the first follow-up beep lands
+      // HB_BEEP_INTERVAL_MS after the initial chirp, not mid-window.
+      fyLastHeartbeatAt = millis();
+    }
     ledFlash(LED_FLASH_MS);
 
 #if STOP_ON_OUI_HIT
@@ -895,6 +949,17 @@ static void autosaveTick() {
   if (!fySpiffsReady || !fyDirty) return;
   if (millis() - fyLastSaveAt < AUTOSAVE_INTERVAL_MS) return;
   fySaveSession();
+}
+
+// Heartbeat beep while at least one target was seen in the last
+// HB_DEVICE_ACTIVE_MS. Fires HB_BEEP_INTERVAL_MS apart.
+static void heartbeatTick() {
+  if (fyLastTargetSeen == 0) return;                           // never seen one
+  unsigned long now = millis();
+  if (now - fyLastTargetSeen > HB_DEVICE_ACTIVE_MS) return;    // gone silent
+  if (now - fyLastHeartbeatAt < HB_BEEP_INTERVAL_MS) return;   // too soon
+  heartbeatBeep();
+  fyLastHeartbeatAt = now;
 }
 
 // ============================================================
@@ -974,6 +1039,7 @@ void loop() {
   updateChannelMode();
   drainAlertQueue();   // Serial.printf happens here, not in callback
   autosaveTick();      // periodic SPIFFS write if dirty
+  heartbeatTick();     // audible beep-pair while a target is still in range
   ledTick();           // turn off LED after LED_FLASH_MS
   printHeartbeat();
   delay(1);
