@@ -46,6 +46,11 @@ static const size_t  fullHopChannelCount = sizeof(fullHopChannels) / sizeof(full
 // heartbeat beeps every HB_BEEP_INTERVAL_MS.
 #define HB_DEVICE_ACTIVE_MS    3000
 #define HB_BEEP_INTERVAL_MS    10000
+// A MAC we haven't heard from in REDISCOVER_MS counts as a fresh discovery
+// next time it shows up — fires the ascending chirp again. Shorter than a
+// Flock's burst-sleep gap would mean false chirps; longer means you'd miss
+// a drive-away/return. 30 s is a good middle ground.
+#define REDISCOVER_MS          30000
 #define NEW_CHIRP_LO_HZ        2000
 #define NEW_CHIRP_HI_HZ        2800
 #define NEW_CHIRP_NOTE_MS      55
@@ -450,34 +455,46 @@ static const char* alertTypeToMethod(AlertType t) {
 }
 
 // Returns index of entry (new or updated), or -1 if table is full.
+// Returns index, and sets *outChirpWorthy = true when the caller should fire
+// the ascending new-discovery chirp. Chirp-worthy means either (a) MAC is
+// brand new to this session, or (b) MAC is known but hasn't been seen in
+// REDISCOVER_MS — i.e. it left RF range and came back.
 static int fyAddDetection(const char* mac, const char* method,
-                          int8_t rssi, uint8_t ch, const char* ssid) {
+                          int8_t rssi, uint8_t ch, const char* ssid,
+                          bool* outChirpWorthy) {
+  uint32_t now = millis();
   for (int i = 0; i < fyDetCount; i++) {
     if (strcasecmp(fyDet[i].mac, mac) == 0) {
+      bool rediscover = (now - fyDet[i].lastSeen) > REDISCOVER_MS;
       if (fyDet[i].count < 0xFFFF) fyDet[i].count++;
-      fyDet[i].lastSeen = millis();
+      fyDet[i].lastSeen = now;
       fyDet[i].rssi     = rssi;
       fyDet[i].channel  = ch;
       if (ssid && ssid[0] && !fyDet[i].ssid[0]) {
         strlcpy(fyDet[i].ssid, ssid, sizeof(fyDet[i].ssid));
       }
       fyDirty = true;
+      if (outChirpWorthy) *outChirpWorthy = rediscover;
       return i;
     }
   }
-  if (fyDetCount >= MAX_DETECTIONS) return -1;
+  if (fyDetCount >= MAX_DETECTIONS) {
+    if (outChirpWorthy) *outChirpWorthy = false;
+    return -1;
+  }
   FYDetection& d = fyDet[fyDetCount];
   strlcpy(d.mac,    mac,                       sizeof(d.mac));
   strlcpy(d.method, method ? method : "",      sizeof(d.method));
   d.rssi      = rssi;
   d.channel   = ch;
-  d.firstSeen = millis();
-  d.lastSeen  = d.firstSeen;
+  d.firstSeen = now;
+  d.lastSeen  = now;
   d.count     = 1;
   if (ssid && ssid[0]) strlcpy(d.ssid, ssid, sizeof(d.ssid));
   else                 d.ssid[0] = '\0';
   fyDetCount++;
   fyDirty = true;
+  if (outChirpWorthy) *outChirpWorthy = true;
   return fyDetCount - 1;
 }
 
@@ -888,11 +905,12 @@ static void drainAlertQueue() {
     const char* method = alertTypeToMethod(e.type);
 
     // Always update the on-device detection table (survives reboot via SPIFFS).
+    // chirpWorthy = true for brand-new MACs AND for MACs rediscovered after
+    // REDISCOVER_MS of silence (drove away and came back).
+    bool chirpWorthy = false;
     int idx = fyAddDetection(macStr, method, e.rssi, e.channel,
-                             (e.type == ALERT_SSID) ? e.ssid : nullptr);
-
-    // A MAC is "new" iff fyAddDetection just inserted it (count is exactly 1).
-    bool isNew = (idx >= 0 && fyDet[idx].count == 1);
+                             (e.type == ALERT_SSID) ? e.ssid : nullptr,
+                             &chirpWorthy);
 
     // Refresh the global "still around" timer for the heartbeat tick.
     // Done unconditionally so a device counts as active even when serial is
@@ -924,7 +942,7 @@ static void drainAlertQueue() {
     //   - NEW MAC  → two fast ascending beeps (clearly distinct sound)
     //   - REPEAT   → silent; the heartbeat tick covers continued presence
     // LED flashes on every emitted detection either way.
-    if (isNew) {
+    if (chirpWorthy) {
       newDetectChirp();
       // Reset the heartbeat phase so the first follow-up beep lands
       // HB_BEEP_INTERVAL_MS after the initial chirp, not mid-window.
