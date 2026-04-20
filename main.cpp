@@ -44,7 +44,7 @@ static const size_t  fullHopChannelCount = sizeof(fullHopChannels) / sizeof(full
 // Audio cadence: two fast ascending beeps on a NEW MAC, then while any
 // target is still in range (seen within HB_DEVICE_ACTIVE_MS), two monotone
 // heartbeat beeps every HB_BEEP_INTERVAL_MS.
-#define HB_DEVICE_ACTIVE_MS    20000
+#define HB_DEVICE_ACTIVE_MS    3000
 #define HB_BEEP_INTERVAL_MS    10000
 #define NEW_CHIRP_LO_HZ        2000
 #define NEW_CHIRP_HI_HZ        2800
