@@ -8,7 +8,7 @@
 
 ## Credit
 
-All WiFi promiscuous detection research — the **30-OUI target list**, the **promiscuous-mode strategy**, and the **addr1-receiver detection technique** — is the work of **ØяĐöØцяöЪöяцฐ / @NitekryDPaul**. The firmware in `promiscuis-flock-you/` is a mod of his original firmware with added SPIFFS persistence and Flask-dashboard integration. Full research writeup: [`datasets/NitekryDPaul_wifi_ouis.md`](datasets/NitekryDPaul_wifi_ouis.md).
+All WiFi promiscuous detection research — the **30-OUI target list**, the **promiscuous-mode strategy**, and the **addr1-receiver detection technique** — is the work of **ØяĐöØцяöЪöяцฐ / @NitekryDPaul**. The firmware here is a mod of his original firmware with added SPIFFS persistence and Flask-dashboard integration. Full research writeup: [`datasets/NitekryDPaul_wifi_ouis.md`](datasets/NitekryDPaul_wifi_ouis.md).
 
 ---
 
@@ -178,17 +178,16 @@ Boot sound: first 6 notes of Super Mario Bros. World 1-2 (underground).
 Requires [PlatformIO](https://platformio.org/).
 
 ```bash
-cd promiscuis-flock-you
 pio run                     # build
 pio run -t upload           # flash
 pio device monitor          # serial output
 ```
 
-The subdirectory has its own `platformio.ini` and `partitions.csv` (1.9 MB SPIFFS partition, 6 MB app). No extra libraries needed beyond the Arduino-ESP32 core that ships with the espressif32 platform.
+`platformio.ini` and `partitions.csv` are at the root (1.9 MB SPIFFS partition, 6 MB app). No extra libraries needed beyond the Arduino-ESP32 core that ships with the espressif32 platform.
 
 ---
 
-## Config cheatsheet (top of `promiscuis-flock-you/main.cpp`)
+## Config cheatsheet (top of `main.cpp`)
 
 | Define | Default | Notes |
 |---|---|---|
@@ -218,15 +217,15 @@ Both modes work simultaneously — the SPIFFS write path doesn't care if a host 
 
 ---
 
-## BLE companion firmware (on `main` branch)
+## BLE companion firmware
 
-The original BLE-only firmware still lives in `src/main.cpp`. It detects Flock and Raven gear via BLE advertisements (OUI prefix, device name, manufacturer ID `0x09C8`, Raven service UUIDs), runs its own WiFi AP with a phone-facing dashboard at `192.168.4.1`, and emits the same Flask JSON schema. Run both firmwares on separate boards for overlapping BLE + WiFi coverage feeding one dashboard. See the `main` branch README for BLE-specific details.
+The BLE-only sibling of this firmware lives on the [`main` branch](https://github.com/colonelpanichacks/flock-you/tree/main). It detects Flock and Raven gear via BLE advertisements (OUI prefix, device name, manufacturer ID `0x09C8`, Raven service UUIDs), runs its own WiFi AP with a phone-facing dashboard at `192.168.4.1`, and emits the same Flask JSON schema. Flash both on separate boards for overlapping BLE + WiFi coverage feeding one Flask dashboard.
 
 ---
 
 ## Acknowledgments
 
-- **ØяĐöØцяöЪöяцฐ (@NitekryDPaul)** — **WiFi promiscuous detection research**: the 30-OUI Flock Safety target list and the addr1-receiver detection technique that form the entirety of the `promiscuis-flock-you` firmware on this branch. The firmware here is a mod of his original work.
+- **ØяĐöØцяöЪöяцฐ (@NitekryDPaul)** — **WiFi promiscuous detection research**: the 30-OUI Flock Safety target list and the addr1-receiver detection technique that are the entirety of this firmware. The code here is a mod of his original work.
 - **Will Greenberg** ([@wgreenberg](https://github.com/wgreenberg)) — BLE manufacturer company ID detection (`0x09C8` XUNTONG) sourced from his [flock-you](https://github.com/wgreenberg/flock-you) fork (used by the BLE companion on `main`)
 - **[DeFlock](https://deflock.me)** ([FoggedLens/deflock](https://github.com/FoggedLens/deflock)) — crowdsourced ALPR location data and detection methodologies. Datasets included in `datasets/`
 - **[GainSec](https://github.com/GainSec)** — Raven BLE service UUID dataset (`raven_configurations.json`) used by the BLE companion
