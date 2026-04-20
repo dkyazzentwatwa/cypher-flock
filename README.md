@@ -16,6 +16,40 @@ No WiFi sniffing — the radio is dedicated to serving the dashboard AP while BL
 
 ---
 
+## What's on this branch (`promiscious`)
+
+This branch adds a **WiFi sibling** to the BLE detector in a new `promiscuis-flock-you/` subdirectory. Same hardware class (XIAO ESP32-S3), same Flask dashboard, complementary RF coverage.
+
+| | BLE detector (`src/main.cpp`) | WiFi promiscuous detector (`promiscuis-flock-you/main.cpp`) |
+|---|---|---|
+| Radio | 2.4 GHz BLE scan | 2.4 GHz 802.11 promiscuous sniff |
+| Targets | Flock / Raven BLE fingerprints | Flock Safety WiFi infrastructure OUIs |
+| Dashboard | Hosts own AP + web UI at `192.168.4.1` | No AP — emits Flask JSON only |
+| GPS | Phone geolocation via on-device AP | Flask-side (USB NMEA / browser) |
+| Persistence | SPIFFS session file | SPIFFS session file (same envelope+CRC format) |
+| Coverage | BLE-advertising Flock gear | Flock infrastructure seen on air, including stations silent on the transmitter-side due to burst-sleep duty cycles |
+
+Both firmwares emit the same Flask-compatible JSON schema over USB, so `api/flockyou.py` ingests them interchangeably. Run one, the other, or both in parallel on the same host — you get a merged detection map.
+
+### WiFi firmware highlights
+
+- **Promiscuous-mode sniff** on channels 1 / 6 / 11 with 350 ms dwell (configurable)
+- **`addr1` + `addr2` matching** — the receiver-side check catches Flock stations that are silent on the transmitter side during their burst-sleep windows
+- **Randomised-MAC and multicast guards** applied before OUI match to eliminate false positives
+- **30-OUI target list** for Flock Safety infrastructure
+- **SPIFFS persistence** with atomic CRC-envelope writes, `/prev_session.json` promotion on boot
+- **Onboard LED flash + buzzer beep** per detection
+- **Boot melody** — first 6 notes of SMB World 1-2 underground
+- **USB-optional** — standalone operation with non-blocking Serial TX
+
+See [`promiscuis-flock-you/README.md`](promiscuis-flock-you/README.md) for the full walkthrough.
+
+### Research credit
+
+All WiFi promiscuous research — the 30-OUI target list and the addr1-receiver detection technique — is the work of **ØяĐöØцяöЪöяцฐ / @NitekryDPaul**. The firmware on this branch is a mod of his original promiscuous-mode firmware with added SPIFFS persistence and Flask-dashboard integration. Full attribution and methodology in [`datasets/NitekryDPaul_wifi_ouis.md`](datasets/NitekryDPaul_wifi_ouis.md).
+
+---
+
 ## Detection Methods
 
 All detection is BLE-based:
@@ -130,6 +164,7 @@ Firmware version is estimated automatically from which service UUIDs are adverti
 
 ## Acknowledgments
 
+- **ØяĐöØцяöЪöяцฐ (@NitekryDPaul)** — **WiFi promiscuous detection research**: 30-OUI Flock Safety target list and the addr1-receiver detection technique that form the `promiscuis-flock-you` firmware on this branch. See `promiscuis-flock-you/` and `datasets/NitekryDPaul_wifi_ouis.md`. The WiFi firmware here is a mod of his original promiscuous-mode firmware.
 - **Will Greenberg** ([@wgreenberg](https://github.com/wgreenberg)) — BLE manufacturer company ID detection (`0x09C8` XUNTONG) sourced from his [flock-you](https://github.com/wgreenberg/flock-you) fork
 - **[DeFlock](https://deflock.me)** ([FoggedLens/deflock](https://github.com/FoggedLens/deflock)) — crowdsourced ALPR location data and detection methodologies. Datasets included in `datasets/`
 - **[GainSec](https://github.com/GainSec)** — Raven BLE service UUID dataset (`raven_configurations.json`) enabling detection of SoundThinking/ShotSpotter acoustic surveillance devices
