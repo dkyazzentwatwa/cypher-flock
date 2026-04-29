@@ -1,6 +1,6 @@
-# Flock-You: Promiscuous WiFi Edition (`promiscious-dev` branch)
+# cypher-flock: Promiscuous WiFi Edition (`promiscious-dev` branch)
 
-<img src="flock.png" alt="Flock You" width="300px">
+<img src="flock.png" alt="cypher-flock" width="300px">
 
 **Passive 2.4 GHz promiscuous-mode detector for Flock Safety surveillance infrastructure. Runs standalone or feeds the Flask dashboard over USB for live GPS-tagged wardriving.**
 
@@ -201,21 +201,24 @@ Boot sound: first 6 notes of Super Mario Bros. World 1-2 (underground).
 
 ---
 
-## Build and flash
+## Build and flash (Arduino CLI)
 
-Requires [PlatformIO](https://platformio.org/).
+Install Arduino CLI and the ESP32 core, then compile/upload with Arduino tooling only.
 
 ```bash
-pio run                     # build
-pio run -t upload           # flash
-pio device monitor          # serial output
+arduino-cli core install esp32:esp32
+arduino-cli lib install "Adafruit SSD1306" "Adafruit GFX Library"
+
+arduino-cli compile --fqbn esp32:esp32:esp32s3 ./cypher_flock_esp32s3.ino
+arduino-cli upload --fqbn esp32:esp32:esp32s3 -p /dev/cu.usbmodemXXXX ./cypher_flock_esp32s3.ino
+arduino-cli monitor -p /dev/cu.usbmodemXXXX -c baudrate=115200
 ```
 
-`platformio.ini` and `partitions.csv` are at the root (1.9 MB SPIFFS partition, 6 MB app). No extra libraries needed beyond the Arduino-ESP32 core that ships with the espressif32 platform.
+This repo is Arduino/Arduino-CLI based (no PlatformIO config required).
 
 ---
 
-## Config cheatsheet (top of `main.cpp`)
+## Config cheatsheet (top of `cypher_flock_esp32s3.ino`)
 
 | Define | Default | Notes |
 |---|---|---|
@@ -263,7 +266,7 @@ The BLE-only sibling of this firmware lives on the [`main` branch](https://githu
 
 ## OUI-SPY Firmware Ecosystem
 
-Flock-You is part of the OUI-SPY firmware family:
+cypher-flock is part of the OUI-SPY firmware family:
 
 | Firmware | Description | Board |
 |----------|-------------|-------|

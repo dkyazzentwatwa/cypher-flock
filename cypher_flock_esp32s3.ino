@@ -4,6 +4,9 @@
 #include <ctype.h>
 #include <string.h>
 #include <SPIFFS.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
 
 // ============================================================
 // CONFIG
@@ -36,6 +39,24 @@ static const size_t  customChannelCount = sizeof(customChannels) / sizeof(custom
 
 static const uint8_t fullHopChannels[] = {1,2,3,4,5,6,7,8,9,10,11};
 static const size_t  fullHopChannelCount = sizeof(fullHopChannels) / sizeof(fullHopChannels[0]);
+
+typedef struct FYDetection FYDetection;
+typedef struct ButtonState ButtonState;
+
+#define BTN_UP_PIN       4
+#define BTN_DOWN_PIN     5
+#define BTN_SELECT_PIN   6
+#define BTN_ACTIVE_STATE LOW
+#define BTN_DEBOUNCE_MS  35
+#define BTN_LONGPRESS_MS 800
+
+#define OLED_SDA_PIN     8
+#define OLED_SCL_PIN     9
+#define OLED_ADDR        0x3C
+#define OLED_W           128
+#define OLED_H           64
+#define OLED_RESET       -1
+#define OLED_REFRESH_MS  200
 
 #define HEARTBEAT_MS    30000
 #define RSSI_MIN        -95
@@ -130,12 +151,14 @@ static volatile AlertEntry alertQueue[ALERT_QUEUE_SIZE];
 static volatile size_t alertHead = 0;  // written by callback
 static volatile size_t alertTail = 0;  // read by loop()
 static portMUX_TYPE    queueMux  = portMUX_INITIALIZER_UNLOCKED;
+static volatile uint32_t alertQueueDrops = 0;
 
 static void IRAM_ATTR enqueueAlert(AlertType type, const uint8_t* mac, int8_t rssi,
                                     uint8_t ch, const char* ssid, const char* kind) {
   portENTER_CRITICAL_ISR(&queueMux);
   size_t next = (alertHead + 1) % ALERT_QUEUE_SIZE;
   if (next == alertTail) {                         // drop if full — loop() is behind
+    alertQueueDrops++;
     portEXIT_CRITICAL_ISR(&queueMux);
     return;
   }
@@ -164,7 +187,7 @@ static void IRAM_ATTR enqueueAlert(AlertType type, const uint8_t* mac, int8_t rs
 // fySaveSession() reads. No mutex needed. The WiFi-task callback never
 // touches this table; it only writes to the lock-free alert ring buffer.
 
-typedef struct {
+typedef struct FYDetection {
   char     mac[18];
   char     method[16];     // "oui_addr2" / "oui_addr1" / "oui_addr3" / "ssid"
   int8_t   rssi;
@@ -187,11 +210,13 @@ static int           fyLastSaveCount  = 0;
 // ============================================================
 
 static uint8_t  currentChannel = 1;
+static uint8_t  runtimeChannelMode = CHANNEL_MODE;
 static size_t   customChannelIndex = 0;
 static size_t   fullHopIndex = 0;
 static unsigned long lastHop = 0;
 static unsigned long lastHeartbeat = 0;
 static volatile bool sniffingStopped = false;
+static volatile bool sniffingPaused = false;
 
 // Dedupe table (small circular, avoids single-slot eviction bug).
 // This is the *serial-rate-limit* dedup — it suppresses beep + emit within
@@ -212,6 +237,33 @@ static volatile unsigned long ledOffAt = 0;
 // HB_DEVICE_ACTIVE_MS the heartbeat stops until the next new detection.
 static unsigned long fyLastTargetSeen  = 0;
 static unsigned long fyLastHeartbeatAt = 0;
+
+static char uiLastMac[18] = "";
+static char uiLastMethod[24] = "";
+static int8_t uiLastRssi = 0;
+static uint8_t uiLastChannel = 0;
+static bool uiDisplayReady = false;
+static bool uiBuzzerMuted = false;
+static unsigned long uiLastRefreshAt = 0;
+static uint8_t uiPage = 0;
+static bool uiMenuMode = false;
+static uint8_t uiMenuIndex = 0;
+static const uint8_t uiMenuItems = 2;
+static unsigned long uiStatusUntilMs = 0;
+static char uiStatusLine[32] = "";
+static Adafruit_SSD1306 display(OLED_W, OLED_H, &Wire, OLED_RESET);
+
+typedef struct ButtonState {
+  uint8_t pin;
+  bool pressed;
+  bool raw;
+  unsigned long changedAt;
+  unsigned long pressedAt;
+} ButtonState;
+
+static ButtonState btnUp = { BTN_UP_PIN, false, false, 0, 0 };
+static ButtonState btnDown = { BTN_DOWN_PIN, false, false, 0, 0 };
+static ButtonState btnSelect = { BTN_SELECT_PIN, false, false, 0, 0 };
 
 // ============================================================
 // 802.11 HEADER
@@ -283,6 +335,7 @@ static void ledTick() {
 
 static void buzzerBeep(unsigned int ms) {
 #if USE_BUZZER
+  if (uiBuzzerMuted) return;
   digitalWrite(BUZZER_PIN, HIGH); delay(ms); digitalWrite(BUZZER_PIN, LOW);
 #endif
 }
@@ -290,6 +343,7 @@ static void buzzerBeep(unsigned int ms) {
 // Two fast ascending beeps — played on the FIRST sighting of a MAC.
 static void newDetectChirp() {
 #if USE_BUZZER
+  if (uiBuzzerMuted) return;
   tone(BUZZER_PIN, NEW_CHIRP_LO_HZ); delay(NEW_CHIRP_NOTE_MS); noTone(BUZZER_PIN);
   delay(NEW_CHIRP_GAP_MS);
   tone(BUZZER_PIN, NEW_CHIRP_HI_HZ); delay(NEW_CHIRP_NOTE_MS); noTone(BUZZER_PIN);
@@ -300,6 +354,7 @@ static void newDetectChirp() {
 // in range (last seen within HB_DEVICE_ACTIVE_MS).
 static void heartbeatBeep() {
 #if USE_BUZZER
+  if (uiBuzzerMuted) return;
   tone(BUZZER_PIN, HB_BEEP_HZ); delay(HB_BEEP_NOTE_MS); noTone(BUZZER_PIN);
   delay(HB_BEEP_GAP_MS);
   tone(BUZZER_PIN, HB_BEEP_HZ); delay(HB_BEEP_NOTE_MS); noTone(BUZZER_PIN);
@@ -307,6 +362,7 @@ static void heartbeatBeep() {
 }
 static void startupBeep() {
 #if USE_BUZZER
+  if (uiBuzzerMuted) return;
   // First 6 notes of SMB World 1-2 (underground). Koji Kondo's descending
   // pattern: C5 → C4 → A4 → A3 → G#4 → G#3 (alternating-octave pairs).
   static const uint16_t notes[6] = { 523, 262, 440, 220, 415, 208 };
@@ -371,7 +427,7 @@ static bool matchSsidKeyword(const char* ssid) {
 }
 
 static const char* channelModeName() {
-  switch (CHANNEL_MODE) {
+  switch (runtimeChannelMode) {
     case CHANNEL_MODE_FULL_HOP: return "FULL_HOP";
     case CHANNEL_MODE_CUSTOM:   return "CUSTOM";
     case CHANNEL_MODE_SINGLE:   return "SINGLE";
@@ -403,46 +459,57 @@ static void stopSniffing(const char* reason) {
   if (sniffingStopped) return;
   sniffingStopped = true;
   esp_wifi_set_promiscuous(false);
-  dualPrintf("[flockyou] sniffing stopped: %s\n", reason);
+  dualPrintf("[cypher-flock] sniffing stopped: %s\n", reason);
+}
+
+static void setSniffPaused(bool paused) {
+  if (sniffingStopped) return;
+  if (sniffingPaused == paused) return;
+  sniffingPaused = paused;
+  esp_wifi_set_promiscuous(paused ? false : true);
+  dualPrintf("[cypher-flock] sniffing %s\n", paused ? "paused" : "resumed");
+  strlcpy(uiStatusLine, paused ? "sniffing paused" : "sniffing resumed", sizeof(uiStatusLine));
+  uiStatusUntilMs = millis() + 1500;
 }
 
 static void applyInitialChannel() {
-#if CHANNEL_MODE == CHANNEL_MODE_SINGLE
-  currentChannel = SINGLE_CHANNEL;
-#elif CHANNEL_MODE == CHANNEL_MODE_CUSTOM
-  currentChannel = customChannels[0];
-#else
-  currentChannel = fullHopChannels[0];
-#endif
+  if (runtimeChannelMode == CHANNEL_MODE_SINGLE) {
+    currentChannel = SINGLE_CHANNEL;
+  } else if (runtimeChannelMode == CHANNEL_MODE_CUSTOM) {
+    customChannelIndex = 0;
+    currentChannel = customChannels[0];
+  } else {
+    fullHopIndex = 0;
+    currentChannel = fullHopChannels[0];
+  }
   esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
   lastHop = millis();  // start dwell timer precisely when channel is first set
 }
 
 static void updateChannelMode() {
-  if (sniffingStopped) return;
-#if CHANNEL_MODE == CHANNEL_MODE_SINGLE
+  if (sniffingStopped || sniffingPaused) return;
+  if (runtimeChannelMode == CHANNEL_MODE_SINGLE) {
   if (currentChannel != SINGLE_CHANNEL) {
     currentChannel = SINGLE_CHANNEL;
     esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
   }
   return;
-#else
+  }
   if (millis() - lastHop < CHANNEL_DWELL_MS) return;
-  #if CHANNEL_MODE == CHANNEL_MODE_CUSTOM
+  if (runtimeChannelMode == CHANNEL_MODE_CUSTOM) {
     customChannelIndex = (customChannelIndex + 1) % customChannelCount;
     currentChannel = customChannels[customChannelIndex];
-  #else
+  } else {
     fullHopIndex = (fullHopIndex + 1) % fullHopChannelCount;
     currentChannel = fullHopChannels[fullHopIndex];
-  #endif
+  }
   esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
   lastHop = millis();
-#endif
 }
 
 static void printHeartbeat() {
   if (millis() - lastHeartbeat >= HEARTBEAT_MS) {
-    dualPrintf("[flockyou] scanning (ch=%u mode=%s det=%d)\n",
+    dualPrintf("[cypher-flock] scanning (ch=%u mode=%s det=%d)\n",
                   currentChannel, channelModeName(), fyDetCount);
     lastHeartbeat = millis();
   }
@@ -675,7 +742,7 @@ static void fySaveSession() {
 
   File f = SPIFFS.open(FY_SESSION_TMP, "w");
   if (!f) {
-    dualPrintf("[flockyou] save failed: cannot open %s\n", FY_SESSION_TMP);
+    dualPrintf("[cypher-flock] save failed: cannot open %s\n", FY_SESSION_TMP);
     return;
   }
   f.printf("{\"v\":1,\"count\":%d,\"bytes\":%u,\"crc\":\"0x%08lX\"}\n",
@@ -695,26 +762,26 @@ static void fySaveSession() {
   f.close();
 
   if (wrote != payloadBytes) {
-    dualPrintf("[flockyou] save WARNING: wrote %u expected %u — aborting\n",
+    dualPrintf("[cypher-flock] save WARNING: wrote %u expected %u — aborting\n",
                (unsigned)wrote, (unsigned)payloadBytes);
     return;
   }
 
   if (!fyValidateSessionFile(FY_SESSION_TMP)) {
-    dualPrintf("[flockyou] save verify FAILED — old session preserved\n");
+    dualPrintf("[cypher-flock] save verify FAILED — old session preserved\n");
     return;
   }
 
   SPIFFS.remove(FY_SESSION_FILE);
   if (!fyAtomicPromote(FY_SESSION_TMP, FY_SESSION_FILE)) {
-    dualPrintf("[flockyou] promote FAILED — data in %s for recovery\n", FY_SESSION_TMP);
+    dualPrintf("[cypher-flock] promote FAILED — data in %s for recovery\n", FY_SESSION_TMP);
     return;
   }
 
   fyLastSaveAt    = millis();
   fyLastSaveCount = savedCount;
   fyDirty         = false;
-  dualPrintf("[flockyou] session saved: %d det, %u bytes, crc=0x%08lX\n",
+  dualPrintf("[cypher-flock] session saved: %d det, %u bytes, crc=0x%08lX\n",
              savedCount, (unsigned)payloadBytes, (unsigned long)crc);
 }
 
@@ -730,12 +797,12 @@ static void fyPromotePrevSession() {
   if (!source) {
     if (SPIFFS.exists(FY_SESSION_FILE)) SPIFFS.remove(FY_SESSION_FILE);
     if (SPIFFS.exists(FY_SESSION_TMP))  SPIFFS.remove(FY_SESSION_TMP);
-    dualPrintln("[flockyou] no valid prior session to promote");
+    dualPrintln("[cypher-flock] no valid prior session to promote");
     return;
   }
 
   if (!fySpiffsCopy(source, FY_PREV_FILE)) {
-    dualPrintf("[flockyou] failed to promote %s → %s\n", source, FY_PREV_FILE);
+    dualPrintf("[cypher-flock] failed to promote %s -> %s\n", source, FY_PREV_FILE);
     return;
   }
   if (SPIFFS.exists(FY_SESSION_FILE)) SPIFFS.remove(FY_SESSION_FILE);
@@ -744,7 +811,7 @@ static void fyPromotePrevSession() {
   File v = SPIFFS.open(FY_PREV_FILE, "r");
   size_t sz = v ? v.size() : 0;
   if (v) v.close();
-  dualPrintf("[flockyou] prior session promoted from %s (%u bytes)\n",
+  dualPrintf("[cypher-flock] prior session promoted from %s (%u bytes)\n",
              source, (unsigned)sz);
 }
 
@@ -825,7 +892,7 @@ static int IRAM_ATTR isWildcardProbeIE(const uint8_t* body, int len) {
 }
 
 static void IRAM_ATTR wifiSniffer(void* buf, wifi_promiscuous_pkt_type_t type) {
-  if (!buf || sniffingStopped) return;
+  if (!buf || sniffingStopped || sniffingPaused) return;
 
 #if PROCESS_MGMT_FRAMES && PROCESS_DATA_FRAMES
   if (type != WIFI_PKT_MGMT && type != WIFI_PKT_DATA) return;
@@ -961,6 +1028,10 @@ static void drainAlertQueue() {
     char macStr[18];
     macToStr(e.mac, macStr, sizeof(macStr));
     const char* method = alertTypeToMethod(e.type);
+    strlcpy(uiLastMac, macStr, sizeof(uiLastMac));
+    snprintf(uiLastMethod, sizeof(uiLastMethod), "wifi_%s", method);
+    uiLastRssi = e.rssi;
+    uiLastChannel = e.channel;
 
     // Always update the on-device detection table (survives reboot via SPIFFS).
     // chirpWorthy = true for brand-new MACs AND for MACs rediscovered after
@@ -982,11 +1053,11 @@ static void drainAlertQueue() {
     char oui[9];
     ouiFromMac(e.mac, oui, sizeof(oui));
     if (e.type == ALERT_SSID) {
-      dualPrintf("[flockyou] DETECT-SSID type=%s mac=%s ssid=\"%s\" rssi=%d ch=%u count=%d\n",
+      dualPrintf("[cypher-flock] DETECT-SSID type=%s mac=%s ssid=\"%s\" rssi=%d ch=%u count=%d\n",
                  e.frameKind, macStr, e.ssid, e.rssi, e.channel,
                  (idx >= 0) ? (int)fyDet[idx].count : 0);
     } else {
-      dualPrintf("[flockyou] DETECT-OUI mac=%s oui=%s rssi=%d ch=%u addr=%s count=%d\n",
+      dualPrintf("[cypher-flock] DETECT-OUI mac=%s oui=%s rssi=%d ch=%u addr=%s count=%d\n",
                  macStr, oui, e.rssi, e.channel,
                  e.frameKind[0] ? e.frameKind : "addr2",
                  (idx >= 0) ? (int)fyDet[idx].count : 0);
@@ -1038,15 +1109,158 @@ static void heartbeatTick() {
   fyLastHeartbeatAt = now;
 }
 
+static void displayInit() {
+  Wire.begin(OLED_SDA_PIN, OLED_SCL_PIN);
+  uiDisplayReady = display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
+  if (!uiDisplayReady) {
+    dualPrintln("[cypher-flock] SSD1306 init FAILED");
+    return;
+  }
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("cypher-flock S3");
+  display.println("Display ready");
+  display.display();
+}
+
+static void buttonsInit() {
+  pinMode(BTN_UP_PIN, INPUT_PULLUP);
+  pinMode(BTN_DOWN_PIN, INPUT_PULLUP);
+  pinMode(BTN_SELECT_PIN, INPUT_PULLUP);
+}
+
+static bool buttonRawPressed(uint8_t pin) {
+  return digitalRead(pin) == BTN_ACTIVE_STATE;
+}
+
+static void applyUiChange(int delta) {
+  if (!uiMenuMode) {
+    uiPage = (uint8_t)((uiPage + (delta > 0 ? 1 : 3)) % 4);
+    return;
+  }
+  if (uiMenuIndex == 0) {
+    int v = (int)runtimeChannelMode + delta;
+    if (v < CHANNEL_MODE_FULL_HOP) v = CHANNEL_MODE_SINGLE;
+    if (v > CHANNEL_MODE_SINGLE) v = CHANNEL_MODE_FULL_HOP;
+    runtimeChannelMode = (uint8_t)v;
+    applyInitialChannel();
+    strlcpy(uiStatusLine, "channel mode updated", sizeof(uiStatusLine));
+    uiStatusUntilMs = millis() + 1200;
+  } else {
+    uiBuzzerMuted = (delta > 0) ? true : false;
+    strlcpy(uiStatusLine, uiBuzzerMuted ? "buzzer muted" : "buzzer unmuted", sizeof(uiStatusLine));
+    uiStatusUntilMs = millis() + 1200;
+  }
+}
+
+static void onShortPress(ButtonState* b) {
+  if (b->pin == BTN_UP_PIN) {
+    applyUiChange(1);
+  } else if (b->pin == BTN_DOWN_PIN) {
+    applyUiChange(-1);
+  } else if (b->pin == BTN_SELECT_PIN) {
+    if (!uiMenuMode) {
+      uiMenuMode = true;
+      uiMenuIndex = 0;
+      strlcpy(uiStatusLine, "menu opened", sizeof(uiStatusLine));
+    } else {
+      uiMenuIndex++;
+      if (uiMenuIndex >= uiMenuItems) {
+        uiMenuMode = false;
+        uiMenuIndex = 0;
+        strlcpy(uiStatusLine, "menu closed", sizeof(uiStatusLine));
+      } else {
+        strlcpy(uiStatusLine, "next menu item", sizeof(uiStatusLine));
+      }
+    }
+    uiStatusUntilMs = millis() + 1200;
+  }
+}
+
+static void onLongPress(ButtonState* b) {
+  if (b->pin == BTN_SELECT_PIN) {
+    setSniffPaused(!sniffingPaused);
+  }
+}
+
+static void pollButton(ButtonState* b) {
+  bool rawNow = buttonRawPressed(b->pin);
+  unsigned long now = millis();
+  if (rawNow != b->raw) {
+    b->raw = rawNow;
+    b->changedAt = now;
+  }
+  if ((now - b->changedAt) < BTN_DEBOUNCE_MS) return;
+  if (b->pressed != b->raw) {
+    b->pressed = b->raw;
+    if (b->pressed) {
+      b->pressedAt = now;
+    } else {
+      unsigned long held = now - b->pressedAt;
+      if (held >= BTN_LONGPRESS_MS) onLongPress(b);
+      else onShortPress(b);
+    }
+  }
+}
+
+static void buttonsPoll() {
+  pollButton(&btnUp);
+  pollButton(&btnDown);
+  pollButton(&btnSelect);
+}
+
+static void displayRender() {
+  if (!uiDisplayReady) return;
+  unsigned long now = millis();
+  if (now - uiLastRefreshAt < OLED_REFRESH_MS) return;
+  uiLastRefreshAt = now;
+
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.printf("State: %s\n", sniffingPaused ? "PAUSED" : "SCANNING");
+  display.printf("Ch:%u  Mode:%s\n", currentChannel, channelModeName());
+
+  if (uiPage == 0) {
+    display.printf("Detections: %d\n", fyDetCount);
+    display.printf("Queue drops: %lu\n", (unsigned long)alertQueueDrops);
+    display.printf("SPIFFS: %s\n", fySpiffsReady ? "OK" : "ERR");
+  } else if (uiPage == 1) {
+    display.println("Last detection:");
+    display.println(uiLastMethod[0] ? uiLastMethod : "(none)");
+    display.println(uiLastMac[0] ? uiLastMac : "--:--:--:--:--:--");
+    display.printf("RSSI:%d Ch:%u\n", uiLastRssi, uiLastChannel);
+  } else if (uiPage == 2) {
+    display.println("Controls:");
+    display.println("UP/DOWN page/menu");
+    display.println("SEL short menu");
+    display.println("SEL long pause");
+    display.printf("Buzzer:%s\n", uiBuzzerMuted ? "MUTED" : "ON");
+  } else {
+    display.println("Storage:");
+    display.printf("Saved count:%d\n", fyLastSaveCount);
+    display.printf("Dirty:%s\n", fyDirty ? "yes" : "no");
+    display.printf("Autosave:%lus\n", (unsigned long)(AUTOSAVE_INTERVAL_MS / 1000));
+  }
+
+  if (uiMenuMode) {
+    display.printf("MENU>%s\n", (uiMenuIndex == 0) ? "Ch Mode" : "Buzzer");
+  } else if (uiStatusUntilMs > now) {
+    display.println(uiStatusLine);
+  } else {
+    display.printf("Page %u/4\n", (unsigned)(uiPage + 1));
+  }
+
+  display.display();
+}
+
 // ============================================================
 // SETUP / LOOP
 // ============================================================
 
 void setup() {
   Serial.begin(115200);
-  // Crucial for USB-optional operation: without this, Serial.write() will
-  // block indefinitely on an ESP32-S3 USB-CDC port when no host is attached.
-  Serial.setTxTimeoutMs(0);
   delay(300);
 
 #if MIRROR_SERIAL
@@ -1070,14 +1284,16 @@ void setup() {
 
   precompileOuis();
   memset(dedupeTable, 0, sizeof(dedupeTable));
+  buttonsInit();
+  displayInit();
 
   // SPIFFS — format on first boot if missing. Non-fatal if it fails.
   if (SPIFFS.begin(true)) {
     fySpiffsReady = true;
-    dualPrintln("[flockyou] SPIFFS ready");
+    dualPrintln("[cypher-flock] SPIFFS ready");
     fyPromotePrevSession();
   } else {
-    dualPrintln("[flockyou] SPIFFS init FAILED — running without persistence");
+    dualPrintln("[cypher-flock] SPIFFS init FAILED - running without persistence");
   }
 
   WiFi.mode(WIFI_MODE_NULL);
@@ -1102,8 +1318,8 @@ void setup() {
   esp_wifi_set_promiscuous_rx_cb(&wifiSniffer);
   esp_wifi_set_promiscuous(true);
 
-  dualPrintln("[flockyou] merged WiFi detector started");
-  dualPrintf("[flockyou] mode=%s dwell_ms=%u start_channel=%u rssi_min=%d spiffs=%d\n",
+  dualPrintln("[cypher-flock] merged WiFi detector started");
+  dualPrintf("[cypher-flock] mode=%s dwell_ms=%u start_channel=%u rssi_min=%d spiffs=%d\n",
                 channelModeName(), CHANNEL_DWELL_MS, currentChannel,
                 RSSI_MIN, fySpiffsReady ? 1 : 0);
 
@@ -1116,6 +1332,8 @@ void loop() {
   drainAlertQueue();   // Serial.printf happens here, not in callback
   autosaveTick();      // periodic SPIFFS write if dirty
   heartbeatTick();     // audible beep-pair while a target is still in range
+  buttonsPoll();
+  displayRender();
   ledTick();           // turn off LED after LED_FLASH_MS
   printHeartbeat();
   delay(1);
