@@ -1,7 +1,7 @@
 # Cypher Flock v2 — Modular Refactor Plan
 
 ## Goals
-- **One codebase**: collapse `cypher_flock_esp32s3.ino` and `cypher_flock_esp32_devkit.ino` into a single `FlockYou.ino` sketch with board profiles selected at compile time.
+- **One codebase**: collapse `cypher_flock_esp32s3.ino` and `cypher_flock_esp32_devkit.ino` into a single `flock-you.ino` sketch with board profiles selected at compile time.
 - **BLE + Raven detection**: add ESP32-BLE-Arduino scanning with confidence scoring and Raven service-UUID fingerprinting.
 - **6–7 OLED screens**: expand the display with live feed, activity chart, proximity bar, GPS view, and session stats.
 - **Dual storage**: LittleFS on both boards; MicroSD on boards that support it (SPI SD card on ESP32 DevKit, SDIO on ESP32-S3 where applicable). Access via embedded AP webserver.
@@ -14,7 +14,7 @@
 
 ```
 flock-you/
-├── FlockYou.ino                   # Main sketch entrypoint (thin — includes all modules)
+├── flock-you.ino                  # Main sketch entrypoint (thin — includes all modules)
 ├── src/
 │   ├── Config.h / .cpp            # Board profile macros + compile-time guards
 │   │   ├── profiles/
@@ -127,25 +127,25 @@ flock-you/
 arduino-cli compile \
   --fqbn esp32:esp32:esp32 \
   --build-property "build.extra_flags=-DESP32 -DBOARD_PROFILE=ESP32_DEVKIT" \
-  ./FlockYou.ino
+  ./flock-you.ino
 
 arduino-cli upload \
   --fqbn esp32:esp32:esp32 \
   --build-property "build.extra_flags=-DESP32 -DBOARD_PROFILE=ESP32_DEVKIT" \
   -p /dev/cu.usbserial-XXXX \
-  ./FlockYou.ino
+  ./flock-you.ino
 
 # ESP32-S3
 arduino-cli compile \
   --fqbn esp32:esp32:esp32s3 \
   --build-property "build.extra_flags=-DESP32 -DBOARD_PROFILE=ESP32_S3" \
-  ./FlockYou.ino
+  ./flock-you.ino
 
 arduino-cli upload \
   --fqbn esp32:esp32:esp32s3 \
   --build-property "build.extra_flags=-DESP32 -DBOARD_PROFILE=ESP32_S3" \
   -p /dev/cu.usbserial-XXXX \
-  ./FlockYou.ino
+  ./flock-you.ino
 ```
 
 ---
@@ -165,7 +165,7 @@ api/tests/
 ## Implementation Order
 
 1. Create `src/` directory and extract `Config.h` + profile headers (`ESP32_DevKit.h`, `ESP32_S3.h`).
-2. Create `FlockYou.ino` as a thin wrapper that includes all `src/` modules.
+2. Create `flock-you.ino` as a thin wrapper that includes all `src/` modules.
 3. Move `WifiSniffer.cpp`, `AlertQueue.h`, `DetectionTable.cpp` from existing `.ino`.
 4. Add `BleScanner.cpp` + Raven UUIDs.
 5. Add confidence scoring into `DetectionTable.cpp`.

@@ -6,8 +6,7 @@ Cypher Flock is a compact Arduino-based ESP32 WiFi detector for passive 2.4 GHz 
 
 ```
 flock-you/
-├── FlockYou.ino                        # Unified firmware entrypoint
-├── flock-you.ino                       # Arduino root-sketch compatibility wrapper
+├── flock-you.ino                       # Unified Arduino firmware entrypoint
 ├── src/
 │   ├── FlockYouCore.h                  # Firmware implementation
 │   ├── Config.h                        # Board profile selection + shared defaults

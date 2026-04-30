@@ -25,7 +25,7 @@ This repo is now maintained as **Cypher Flock**.
 
 The v2 firmware is a single compile-time-profiled Arduino sketch:
 
-- [FlockYou.ino](FlockYou.ino)
+- [flock-you.ino](flock-you.ino)
 
 ## Supported Boards
 
@@ -148,8 +148,7 @@ Example:
 
 | Path | Purpose |
 |---|---|
-| `FlockYou.ino` | Unified firmware entrypoint |
-| `flock-you.ino` | Arduino CLI compatibility wrapper for the root sketch folder |
+| `flock-you.ino` | Unified firmware entrypoint |
 | `src/` | Firmware modules and board profiles |
 | `api/flockyou.py` | Host-side Flask dashboard and serial ingester |
 | `datasets/` | Research notes and target lists |
