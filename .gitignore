@@ -4,3 +4,8 @@
 .vscode/
 
 .DS_Store
+
+.pytest_cache/
+api/data/
+api/exports/
+data/

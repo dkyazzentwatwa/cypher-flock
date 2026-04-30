@@ -41,7 +41,9 @@ next_detection_id = 1  # Unique ID counter
 settings = {'gps_port': '', 'flock_port': '', 'filter': 'all'}
 
 # Data storage paths
-DATA_DIR = Path('data')
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / 'data'
+EXPORTS_DIR = BASE_DIR / 'exports'
 CUMULATIVE_DATA_FILE = DATA_DIR / 'cumulative_detections.pkl'
 SETTINGS_FILE = DATA_DIR / 'settings.json'
 
@@ -826,9 +828,8 @@ def export_csv():
         return jsonify({'status': 'error', 'message': 'No detections to export'}), 400
     
     filename = f"{filename_prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-    filepath = os.path.join('exports', filename)
-    
-    os.makedirs('exports', exist_ok=True)
+    EXPORTS_DIR.mkdir(exist_ok=True)
+    filepath = EXPORTS_DIR / filename
     
     with open(filepath, 'w', newline='', encoding='utf-8') as csvfile:
         fieldnames = [
@@ -891,9 +892,8 @@ def export_kml():
         return jsonify({'status': 'error', 'message': 'No detections to export'}), 400
     
     filename = f"{filename_prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.kml"
-    filepath = os.path.join('exports', filename)
-    
-    os.makedirs('exports', exist_ok=True)
+    EXPORTS_DIR.mkdir(exist_ok=True)
+    filepath = EXPORTS_DIR / filename
     
     kml_content = f"""<?xml version="1.0" encoding="UTF-8"?>
 <kml xmlns="http://www.opengis.net/kml/2.2">
