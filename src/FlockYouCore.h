@@ -1739,19 +1739,33 @@ static void displayInit() {
 
   display.clearDisplay();
   display.drawRect(0, 0, OLED_W, OLED_H, SSD1306_WHITE);
-  display.drawRect(2, 2, OLED_W - 4, OLED_H - 4, SSD1306_WHITE);
-  display.fillRect(8, 9, OLED_W - 16, 20, SSD1306_WHITE);
-  display.drawFastHLine(14, 34, OLED_W - 28, SSD1306_WHITE);
+  display.drawFastHLine(4, 4, 24, SSD1306_WHITE);
+  display.drawFastVLine(4, 4, 12, SSD1306_WHITE);
+  display.drawFastHLine(OLED_W - 28, 4, 24, SSD1306_WHITE);
+  display.drawFastVLine(OLED_W - 5, 4, 12, SSD1306_WHITE);
+  display.drawFastHLine(4, OLED_H - 5, 24, SSD1306_WHITE);
+  display.drawFastVLine(4, OLED_H - 16, 12, SSD1306_WHITE);
+  display.drawFastHLine(OLED_W - 28, OLED_H - 5, 24, SSD1306_WHITE);
+  display.drawFastVLine(OLED_W - 5, OLED_H - 16, 12, SSD1306_WHITE);
 
-  uiFonts.setFont(u8g2_font_profont17_tf);
-  uiFonts.setForegroundColor(SSD1306_BLACK);
-  uiFonts.drawStr(17, 24, "CYPHER FLOCK");
+  display.drawRoundRect(49, 6, 30, 16, 3, SSD1306_WHITE);
+  display.fillRect(55, 3, 18, 4, SSD1306_WHITE);
+  display.drawCircle(64, 14, 5, SSD1306_WHITE);
+  display.drawPixel(64, 14, SSD1306_WHITE);
+  display.drawFastHLine(18, 14, 24, SSD1306_WHITE);
+  display.drawFastHLine(86, 14, 24, SSD1306_WHITE);
+  display.drawFastHLine(26, 18, 12, SSD1306_WHITE);
+  display.drawFastHLine(90, 18, 12, SSD1306_WHITE);
 
+  uiFonts.setFont(u8g2_font_7x13B_tf);
   uiFonts.setForegroundColor(SSD1306_WHITE);
-  uiFonts.setFont(u8g2_font_6x10_tf);
-  uiFonts.drawStr(9, 45, PROFILE_NAME);
+  uiFonts.drawStr(21, 40, "CYPHER FLOCK");
+  display.drawFastHLine(24, 45, 80, SSD1306_WHITE);
+  display.drawPixel(18, 45, SSD1306_WHITE);
+  display.drawPixel(109, 45, SSD1306_WHITE);
+
   uiFonts.setFont(u8g2_font_5x7_tf);
-  uiFonts.drawStr(9, 57, "v2 detector  booting");
+  uiFonts.drawStr(14, 56, "detect flock cameras");
   display.display();
   delay(5000);
 }
