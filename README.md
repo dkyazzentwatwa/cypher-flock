@@ -158,6 +158,3 @@ Example:
 
 Cypher Flock builds on the open research and field work of others in the WiFi detection space. The target-list and signature work in this repo is credited in the code and datasets where it originated.
 
-## License
-
-If you want, I can add a real license file next. For now this repo is documented as a personal project fork under the Cypher Flock name.
