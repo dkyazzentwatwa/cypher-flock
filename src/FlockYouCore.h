@@ -7,6 +7,7 @@
 #include "esp_wifi.h"
 #include <ctype.h>
 #include <string.h>
+#include <strings.h>
 #include <stdarg.h>
 #include <string>
 #include "Config.h"
@@ -209,6 +210,7 @@ static int           fyLastSaveCount  = 0;
 
 static uint8_t  currentChannel = 1;
 static uint8_t  runtimeChannelMode = CHANNEL_MODE;
+static uint8_t  runtimeSingleChannel = SINGLE_CHANNEL;
 static size_t   customChannelIndex = 0;
 static size_t   fullHopIndex = 0;
 static unsigned long lastHop = 0;
@@ -281,6 +283,10 @@ static unsigned long uiStatusUntilMs = 0;
 static char uiStatusLine[32] = "";
 static Adafruit_SSD1306 display(OLED_W, OLED_H, &Wire, OLED_RESET);
 static U8G2_FOR_ADAFRUIT_GFX uiFonts;
+
+static char serialCmdBuf[96] = "";
+static uint8_t serialCmdLen = 0;
+static bool serialSawCr = false;
 
 typedef struct ButtonState {
   uint8_t pin;
@@ -616,7 +622,7 @@ static void setSniffPaused(bool paused) {
 
 static void applyInitialChannel() {
   if (runtimeChannelMode == CHANNEL_MODE_SINGLE) {
-    currentChannel = SINGLE_CHANNEL;
+    currentChannel = runtimeSingleChannel;
   } else if (runtimeChannelMode == CHANNEL_MODE_CUSTOM) {
     customChannelIndex = 0;
     currentChannel = customChannels[0];
@@ -631,11 +637,11 @@ static void applyInitialChannel() {
 static void updateChannelMode() {
   if (sniffingStopped || sniffingPaused) return;
   if (runtimeChannelMode == CHANNEL_MODE_SINGLE) {
-  if (currentChannel != SINGLE_CHANNEL) {
-    currentChannel = SINGLE_CHANNEL;
-    esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
-  }
-  return;
+    if (currentChannel != runtimeSingleChannel) {
+      currentChannel = runtimeSingleChannel;
+      esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
+    }
+    return;
   }
   if (millis() - lastHop < dwellForChannel(currentChannel)) return;
   if (runtimeChannelMode == CHANNEL_MODE_CUSTOM) {
@@ -1066,8 +1072,8 @@ static void storageLogDetection(const FYDetection& d) {
 // and extracts these fields:  mac_address, rssi, channel, frequency, ssid,
 // device_name, gps.latitude, gps.longitude, gps.accuracy.
 //
-// GPS is handled Flask-side via its own USB NMEA puck or browser geolocation;
-// we don't embed GPS here because there's no on-device AP / phone link.
+// The Flask app can add GPS from a host-side USB NMEA puck or browser
+// geolocation. Cypherbox builds can also read on-device GPS via SerialGPS.
 
 static void emitDetectionJSON(const char* mac, const char* method, const char* protocol,
                               const char* deviceName, int8_t rssi, uint8_t ch,
@@ -2053,6 +2059,337 @@ static void displayRender() {
 }
 
 // ============================================================
+// SERIAL COMMAND FALLBACK
+// ============================================================
+
+static const char* uiPageName(uint8_t page) {
+  switch (page) {
+    case 0: return "dashboard";
+    case 1: return "stats";
+    case 2: return "last hit";
+    case 3: return "live feed";
+    case 4: return "GPS";
+    case 5: return "activity";
+    case 6: return "proximity";
+    default: return "unknown";
+  }
+}
+
+static void cmdPrintf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+static void cmdPrintf(const char* fmt, ...) {
+  char buf[192];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, args);
+  va_end(args);
+  dualPrintf("[cypher-flock:cmd] %s\n", buf);
+}
+
+static char* trimCommand(char* s) {
+  while (*s && isspace((unsigned char)*s)) s++;
+  char* end = s + strlen(s);
+  while (end > s && isspace((unsigned char)*(end - 1))) *(--end) = '\0';
+  return s;
+}
+
+static int splitCommand(char* cmd, char** argv, int maxArgs) {
+  int argc = 0;
+  char* p = cmd;
+  while (*p && argc < maxArgs) {
+    while (*p && isspace((unsigned char)*p)) p++;
+    if (!*p) break;
+    argv[argc++] = p;
+    while (*p && !isspace((unsigned char)*p)) p++;
+    if (*p) *p++ = '\0';
+  }
+  return argc;
+}
+
+static bool argEquals(const char* a, const char* b) {
+  return a && b && strcasecmp(a, b) == 0;
+}
+
+static void serialPrintHelp() {
+  cmdPrintf("commands: help, status, page [next|prev|0-6], menu");
+  cmdPrintf("scan: mode full|custom|single, channel 1-13, scan pause|resume");
+  cmdPrintf("controls: buzzer on|off, stealth on|off, gps, storage, detections");
+  cmdPrintf("session: reset session, save, reboot");
+}
+
+static void serialPrintStatus() {
+  const char* scanState = sniffingStopped ? "stopped" : (sniffingPaused ? "paused" : "running");
+  cmdPrintf("profile=%s uptime=%lus heap=%lu scan=%s mode=%s channel=%u detections=%d",
+            PROFILE_NAME, (unsigned long)(millis() / 1000), (unsigned long)ESP.getFreeHeap(),
+            scanState, channelModeName(), (unsigned)currentChannel, fyDetCount);
+  cmdPrintf("littlefs=%s sd=%s gps=%s display=%s stealth=%s buzzer=%s",
+            fySpiffsReady ? "ready" : "off",
+#if ENABLE_SD_LOGGING
+            sdReady ? "ready" : "not-ready",
+#else
+            "not-compiled",
+#endif
+#if ENABLE_GPS
+            gps.location.isValid() ? "lock" : "no-lock",
+#else
+            "not-compiled",
+#endif
+            uiDisplayReady ? "ready" : "not-ready",
+            stealthMode ? "on" : "off",
+            uiBuzzerMuted ? "muted" : "on");
+}
+
+static void serialPrintPage() {
+  cmdPrintf("page=%u name=\"%s\"", (unsigned)uiPage, uiPageName(uiPage));
+}
+
+static void serialSetPage(const char* arg) {
+  if (argEquals(arg, "next")) {
+    uiPage = (uint8_t)((uiPage + 1) % 7);
+  } else if (argEquals(arg, "prev")) {
+    uiPage = (uint8_t)((uiPage + 6) % 7);
+  } else if (arg && isdigit((unsigned char)arg[0])) {
+    int page = atoi(arg);
+    if (page < 0 || page > 6) {
+      cmdPrintf("page must be 0-6");
+      return;
+    }
+    uiPage = (uint8_t)page;
+  } else {
+    cmdPrintf("usage: page [next|prev|0-6]");
+    return;
+  }
+  strlcpy(uiStatusLine, "serial page change", sizeof(uiStatusLine));
+  uiStatusUntilMs = millis() + 1200;
+  serialPrintPage();
+}
+
+static void serialPrintMenu() {
+  cmdPrintf("channel mode=%s channel=%u single_channel=%u", channelModeName(),
+            (unsigned)currentChannel, (unsigned)runtimeSingleChannel);
+  cmdPrintf("buzzer=%s hardware=%s stealth=%s menu=%s",
+            uiBuzzerMuted ? "muted" : "on",
+#if USE_BUZZER
+            "enabled",
+#else
+            "disabled",
+#endif
+            stealthMode ? "on" : "off",
+            uiMenuMode ? "open" : "closed");
+}
+
+static void serialSetMode(const char* arg) {
+  if (argEquals(arg, "full")) {
+    runtimeChannelMode = CHANNEL_MODE_FULL_HOP;
+  } else if (argEquals(arg, "custom")) {
+    runtimeChannelMode = CHANNEL_MODE_CUSTOM;
+  } else if (argEquals(arg, "single")) {
+    runtimeChannelMode = CHANNEL_MODE_SINGLE;
+  } else {
+    cmdPrintf("usage: mode full|custom|single");
+    return;
+  }
+  applyInitialChannel();
+  strlcpy(uiStatusLine, "serial mode change", sizeof(uiStatusLine));
+  uiStatusUntilMs = millis() + 1200;
+  cmdPrintf("mode=%s channel=%u", channelModeName(), (unsigned)currentChannel);
+}
+
+static void serialSetChannel(const char* arg) {
+  if (!arg || !isdigit((unsigned char)arg[0])) {
+    cmdPrintf("usage: channel 1-13");
+    return;
+  }
+  int channel = atoi(arg);
+  if (channel < 1 || channel > 13) {
+    cmdPrintf("channel must be 1-13");
+    return;
+  }
+  runtimeSingleChannel = (uint8_t)channel;
+  runtimeChannelMode = CHANNEL_MODE_SINGLE;
+  applyInitialChannel();
+  strlcpy(uiStatusLine, "serial channel set", sizeof(uiStatusLine));
+  uiStatusUntilMs = millis() + 1200;
+  cmdPrintf("mode=%s channel=%u", channelModeName(), (unsigned)currentChannel);
+}
+
+static void serialSetBuzzer(const char* arg) {
+  if (argEquals(arg, "on")) {
+    uiBuzzerMuted = false;
+  } else if (argEquals(arg, "off")) {
+    uiBuzzerMuted = true;
+  } else {
+    cmdPrintf("usage: buzzer on|off");
+    return;
+  }
+#if USE_BUZZER
+  cmdPrintf("buzzer=%s", uiBuzzerMuted ? "muted" : "on");
+#else
+  cmdPrintf("buzzer=%s hardware=disabled", uiBuzzerMuted ? "muted" : "on");
+#endif
+}
+
+static void serialSetStealth(const char* arg) {
+  if (argEquals(arg, "on")) {
+    stealthMode = true;
+    uiBuzzerMuted = true;
+    if (uiDisplayReady) {
+      display.clearDisplay();
+      display.display();
+    }
+  } else if (argEquals(arg, "off")) {
+    stealthMode = false;
+  } else {
+    cmdPrintf("usage: stealth on|off");
+    return;
+  }
+  strlcpy(uiStatusLine, stealthMode ? "stealth on" : "stealth off", sizeof(uiStatusLine));
+  uiStatusUntilMs = millis() + 1200;
+  cmdPrintf("stealth=%s buzzer=%s", stealthMode ? "on" : "off", uiBuzzerMuted ? "muted" : "on");
+}
+
+static void serialPrintGps() {
+#if ENABLE_GPS
+  if (gps.location.isValid()) {
+    cmdPrintf("gps=fix satellites=%lu lat=%.6f lon=%.6f speed_mph=%.1f altitude_m=%.1f",
+              (unsigned long)(gps.satellites.isValid() ? gps.satellites.value() : 0),
+              gps.location.lat(), gps.location.lng(), gps.speed.mph(), gps.altitude.meters());
+  } else {
+    cmdPrintf("gps=no-fix satellites=%lu waiting=NMEA",
+              (unsigned long)(gps.satellites.isValid() ? gps.satellites.value() : 0));
+  }
+#else
+  cmdPrintf("GPS not compiled");
+#endif
+}
+
+static void serialPrintStorage() {
+  cmdPrintf("littlefs=%s detections=%d dirty=%s last_save_count=%d",
+            fySpiffsReady ? "ready" : "off", fyDetCount, fyDirty ? "yes" : "no", fyLastSaveCount);
+#if ENABLE_SD_LOGGING
+  cmdPrintf("sd=compiled ready=%s log=%s", sdReady ? "yes" : "no", currentLogFile.c_str());
+#else
+  cmdPrintf("sd=not-compiled");
+#endif
+}
+
+static void serialPrintDetections() {
+  cmdPrintf("detections=%d wifi=%lu ble=%lu raven=%lu", fyDetCount,
+            (unsigned long)sessionWifi, (unsigned long)sessionBle, (unsigned long)sessionRaven);
+  if (uiLastMac[0]) {
+    cmdPrintf("last mac=%s method=%s protocol=%s rssi=%d channel=%u confidence=%u label=%s name=\"%s\"",
+              uiLastMac, uiLastMethod, uiLastProtocol, uiLastRssi,
+              (unsigned)uiLastChannel, (unsigned)uiLastConfidence, uiLastConfidenceLabel, uiLastName);
+  } else {
+    cmdPrintf("last=none");
+  }
+}
+
+static void serialResetSession() {
+  fyDetCount = 0;
+  fyDirty = true;
+  sessionWifi = sessionBle = sessionRaven = 0;
+  memset(uiLastMac, 0, sizeof(uiLastMac));
+  memset(uiLastMethod, 0, sizeof(uiLastMethod));
+  memset(uiLastName, 0, sizeof(uiLastName));
+  memset(uiLastProtocol, 0, sizeof(uiLastProtocol));
+  memset(uiLiveFeed, 0, sizeof(uiLiveFeed));
+  strlcpy(uiLastConfidenceLabel, "LOW", sizeof(uiLastConfidenceLabel));
+  uiLastRssi = 0;
+  uiLastChannel = 0;
+  uiLastConfidence = 0;
+  strlcpy(uiStatusLine, "session reset", sizeof(uiStatusLine));
+  uiStatusUntilMs = millis() + 1200;
+  cmdPrintf("session reset");
+}
+
+static void serialExecuteCommand(char* raw) {
+  char* cmd = trimCommand(raw);
+  if (!*cmd || *cmd == '{') return;
+
+  char* argv[4] = {nullptr, nullptr, nullptr, nullptr};
+  int argc = splitCommand(cmd, argv, 4);
+  if (argc == 0) return;
+
+  if (argEquals(argv[0], "help")) {
+    serialPrintHelp();
+  } else if (argEquals(argv[0], "status")) {
+    serialPrintStatus();
+  } else if (argEquals(argv[0], "page")) {
+    if (argc == 1) serialPrintPage();
+    else serialSetPage(argv[1]);
+  } else if (argEquals(argv[0], "menu")) {
+    serialPrintMenu();
+  } else if (argEquals(argv[0], "mode")) {
+    serialSetMode(argc > 1 ? argv[1] : nullptr);
+  } else if (argEquals(argv[0], "channel")) {
+    serialSetChannel(argc > 1 ? argv[1] : nullptr);
+  } else if (argEquals(argv[0], "scan")) {
+    if (argEquals(argc > 1 ? argv[1] : nullptr, "pause")) setSniffPaused(true);
+    else if (argEquals(argc > 1 ? argv[1] : nullptr, "resume")) setSniffPaused(false);
+    else { cmdPrintf("usage: scan pause|resume"); return; }
+    cmdPrintf("scan=%s", sniffingPaused ? "paused" : "running");
+  } else if (argEquals(argv[0], "buzzer")) {
+    serialSetBuzzer(argc > 1 ? argv[1] : nullptr);
+  } else if (argEquals(argv[0], "stealth")) {
+    serialSetStealth(argc > 1 ? argv[1] : nullptr);
+  } else if (argEquals(argv[0], "gps")) {
+    serialPrintGps();
+  } else if (argEquals(argv[0], "storage")) {
+    serialPrintStorage();
+  } else if (argEquals(argv[0], "detections")) {
+    serialPrintDetections();
+  } else if (argEquals(argv[0], "reset") && argEquals(argc > 1 ? argv[1] : nullptr, "session")) {
+    serialResetSession();
+  } else if (argEquals(argv[0], "save")) {
+    if (!fySpiffsReady) {
+      cmdPrintf("save skipped: LittleFS not ready");
+    } else {
+      fyDirty = true;
+      fySaveSession();
+      cmdPrintf("save requested");
+    }
+  } else if (argEquals(argv[0], "reboot")) {
+    cmdPrintf("rebooting");
+    delay(100);
+    ESP.restart();
+  } else {
+    cmdPrintf("unknown command: %s (try help)", argv[0]);
+  }
+}
+
+static void serialCommandTick() {
+  while (Serial.available() > 0) {
+    char c = (char)Serial.read();
+    if (c == '\r') {
+      serialCmdBuf[serialCmdLen] = '\0';
+      serialExecuteCommand(serialCmdBuf);
+      serialCmdLen = 0;
+      serialSawCr = true;
+    } else if (c == '\n') {
+      if (serialSawCr) {
+        serialSawCr = false;
+        continue;
+      }
+      serialCmdBuf[serialCmdLen] = '\0';
+      serialExecuteCommand(serialCmdBuf);
+      serialCmdLen = 0;
+    } else if (c == '\b' || c == 127) {
+      serialSawCr = false;
+      if (serialCmdLen > 0) serialCmdLen--;
+    } else {
+      serialSawCr = false;
+      if (serialCmdLen + 1 >= sizeof(serialCmdBuf)) {
+        serialCmdLen = 0;
+        serialCmdBuf[0] = '\0';
+        cmdPrintf("command too long");
+      } else {
+        serialCmdBuf[serialCmdLen++] = c;
+      }
+    }
+  }
+}
+
+// ============================================================
 // SETUP / LOOP
 // ============================================================
 
@@ -2143,6 +2480,7 @@ void loop() {
   lifetimeTick();
   activityTick();
   gpsTick();
+  serialCommandTick();
   webServer.handleClient();
   rssiTrackExpire();
   heartbeatTick();     // audible beep-pair while a target is still in range

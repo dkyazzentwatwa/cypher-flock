@@ -144,6 +144,34 @@ Example:
 {"event":"detection","detection_method":"wifi_oui_addr2","protocol":"wifi_2_4ghz","mac_address":"aa:bb:cc:dd:ee:ff","oui":"aa:bb:cc","device_name":"","rssi":-62,"channel":6,"frequency":2437,"ssid":"","confidence":50,"confidence_label":"MEDIUM"}
 ```
 
+## Serial Commands
+
+All profiles also expose a shell-style command fallback over USB serial at `115200`. This is useful for a DevKit running without an OLED, a board with broken buttons, or a headless bench test.
+
+```bash
+arduino-cli monitor -p /dev/cu.usbserial-XXXX --baud 115200
+```
+
+Core commands:
+
+| Command | Purpose |
+|---|---|
+| `help` | Print the command reference |
+| `status` | Show profile, scan state, heap, channel, detections, display, storage, GPS, and buzzer state |
+| `page`, `page next`, `page prev`, `page 0-6` | Inspect or change the OLED page from serial |
+| `menu` | Show channel mode, single-channel value, buzzer, stealth, and menu state |
+| `mode full`, `mode custom`, `mode single` | Change channel hopping mode |
+| `channel 1-13` | Switch to single-channel mode on a fixed channel |
+| `scan pause`, `scan resume` | Pause or resume passive scanning |
+| `buzzer on`, `buzzer off` | Toggle buzzer output where hardware is enabled |
+| `stealth on`, `stealth off` | Toggle display/buzzer stealth mode |
+| `gps` | Show GPS fix details, or report that GPS is not compiled for the profile |
+| `storage` | Show LittleFS, SD, save, and detection storage state |
+| `detections` | Show session counts and the last detection summary |
+| `reset session` | Clear current in-memory detections and session counters |
+| `save` | Force a LittleFS session save |
+| `reboot` | Restart the board |
+
 ## Files
 
 | Path | Purpose |
@@ -157,4 +185,3 @@ Example:
 ## Acknowledgments
 
 Cypher Flock builds on the open research and field work of others in the WiFi detection space. The target-list and signature work in this repo is credited in the code and datasets where it originated.
-
