@@ -9,6 +9,17 @@
 #define USE_LED          1
 #define LED_ACTIVE_HIGH  1
 #define LED_FLASH_MS     120
+#define USE_RGB_LED      1
+#define RGB_LED_PIN      26
+#define RGB_LED_COUNT    1
+#define RGB_HEARTBEAT_MS 5000
+#define RGB_PULSE_MS     700
+#define RGB_GREEN_R      0
+#define RGB_GREEN_G      32
+#define RGB_GREEN_B      0
+#define RGB_RED_R        48
+#define RGB_RED_G        0
+#define RGB_RED_B        0
 
 #define MIRROR_SERIAL    0
 #define MIRROR_TX_PIN    17

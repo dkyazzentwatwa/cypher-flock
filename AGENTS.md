@@ -10,14 +10,14 @@ flock-you/
 ├── src/
 │   ├── FlockYouCore.h                  # Firmware implementation
 │   ├── Config.h                        # Board profile selection + shared defaults
-│   └── profiles/                       # ESP32 DevKit / ESP32-S3 / Cypherbox pin profiles
+│   └── profiles/                       # ESP32 DevKit / ESP32-S3 / Cypherbox / Waveshare AMOLED pin profiles
 ├── api/
 │   ├── flockyou.py                     # Flask + Socket.IO dashboard (main entry)
 │   ├── requirements.txt                 # Python deps
 │   └── templates/index.html             # Web dashboard frontend
 ├── datasets/                            # Research notes, target lists, OUI CSVs
 ├── img/                                 # Hardware and UI photos
-└── partitions.csv                      # 4 MB-safe no-OTA layout for ESP32/Cypherbox
+└── partitions.csv                      # 16 MB custom layout for Waveshare AMOLED builds
 ```
 
 ## Firmware Build & Flash
@@ -27,7 +27,7 @@ Use `arduino-cli` for all firmware work.
 **ESP32 DevKit:**
 ```bash
 arduino-cli core install esp32:esp32
-arduino-cli lib install "Adafruit SSD1306" "Adafruit GFX Library" "U8g2_for_Adafruit_GFX" "NimBLE-Arduino" "TinyGPSPlus"
+arduino-cli lib install "Adafruit SSD1306" "Adafruit GFX Library" "Adafruit NeoPixel" "U8g2_for_Adafruit_GFX" "NimBLE-Arduino" "TinyGPSPlus"
 arduino-cli compile --fqbn esp32:esp32:esp32:PartitionScheme=huge_app \
   --build-property "build.extra_flags=-DESP32 -DBOARD_PROFILE=ESP32_DEVKIT" .
 arduino-cli upload --fqbn esp32:esp32:esp32:PartitionScheme=huge_app \
@@ -53,11 +53,35 @@ arduino-cli upload --fqbn esp32:esp32:esp32:PartitionScheme=no_ota \
   -p /dev/cu.usbserial-XXXX .
 ```
 
-The root `partitions.csv` is a 4 MB-safe no-OTA layout with a 2 MB app slot and LittleFS storage. Use it for Cypherbox so the board does not receive an invalid partition table.
+**Waveshare ESP32-S3-Touch-AMOLED-1.8:**
+```bash
+arduino-cli lib install "GFX Library for Arduino" "Arduino_DriveBus" "ESP32_IO_Expander" "XPowersLib"
+FQBN='esp32:esp32:esp32s3:FlashSize=16M,PSRAM=opi,USBMode=default,CDCOnBoot=cdc,PartitionScheme=custom'
+PORT='/dev/cu.usbmodemXXXX'
+BUILD_DIR='/tmp/flock-build-waveshare-amoled'
+arduino-cli compile --fqbn "$FQBN" --build-path "$BUILD_DIR" \
+  --build-property "build.extra_flags=-DESP32 -DBOARD_PROFILE=ESP32_WAVESHARE_AMOLED_18" .
+python3 - <<'PY'
+import serial, time
+port = '/dev/cu.usbmodemXXXX'
+ser = serial.Serial(port, 1200)
+ser.dtr = False
+ser.rts = True
+time.sleep(0.2)
+ser.close()
+PY
+arduino-cli upload -p "$PORT" --fqbn "$FQBN" --input-dir "$BUILD_DIR" .
+```
+
+The root `partitions.csv` is a 16 MB custom layout for the Waveshare AMOLED profile. Cypherbox should keep using the built-in `PartitionScheme=no_ota` command above.
+
+Cypherbox uses an onboard WS2812 RGB LED on GPIO 26. Keep its running heartbeat as a soft green pulse every 5 seconds and detection feedback as a red pulse.
+
+Waveshare AMOLED uses SH8601 QSPI display pins `4/5/6/7/11/12`, FT3168 touch and AXP2101 PMIC on I2C `SDA=15` / `SCL=14`, touch interrupt `21`, BOOT on GPIO0, and 1-bit SD_MMC `CLK=2`, `CMD=1`, `D0=3`. Preserve the detector UI and JSON serial contract; do not port the voice-bot companion shell into this repo. For this profile, short BOOT clicks cycle channel hopping mode and long BOOT press toggles stealth. Keep SD_MMC non-formatting by default and expose mount/write errors through the `storage` serial command.
 
 **Serial monitor:**
 ```bash
-arduino-cli monitor -p /dev/cu.usbserial-XXXX --baud 115200
+arduino-cli monitor -p /dev/cu.usbserial-XXXX -c baudrate=115200
 ```
 
 Port names vary per machine — detect with `arduino-cli board list` or `ls /dev/cu.*`.

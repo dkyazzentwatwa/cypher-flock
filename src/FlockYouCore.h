@@ -11,19 +11,41 @@
 #include <stdarg.h>
 #include <string>
 #include "Config.h"
+
+#ifndef USB_SERIAL_WAIT_MS
+#define USB_SERIAL_WAIT_MS 3000
+#endif
 #include <LittleFS.h>
 #include <FS.h>
 #if ENABLE_SD_LOGGING
 #include <SPI.h>
 #include <SD.h>
+#if USE_SD_MMC
+#include <SD_MMC.h>
+#endif
 #endif
 #if ENABLE_GPS
 #include <TinyGPSPlus.h>
 #endif
 #include <Wire.h>
 #include <Adafruit_GFX.h>
+#if USE_AMOLED_DISPLAY
+#include <Adafruit_XCA9554.h>
+#include <Arduino_GFX_Library.h>
+#include <Arduino_DriveBus_Library.h>
+#include <memory>
+#endif
+#if ENABLE_POWER_STATUS
+#define XPOWERS_CHIP_AXP2101
+#include <XPowersLib.h>
+#endif
+#if !USE_AMOLED_DISPLAY
 #include <Adafruit_SSD1306.h>
 #include <U8g2_for_Adafruit_GFX.h>
+#endif
+#if USE_RGB_LED
+#include <Adafruit_NeoPixel.h>
+#endif
 
 #define SPIFFS LittleFS
 
@@ -221,6 +243,11 @@ static bool stealthMode = false;
 static bool sdReady = false;
 static bool apReady = false;
 static String currentLogFile = "/FlockLog_001.csv";
+#if ENABLE_SD_LOGGING
+static char sdStatusLine[48] = "not initialized";
+static uint8_t sdCardTypeValue = CARD_NONE;
+static uint64_t sdCardSizeBytes = 0;
+#endif
 static NimBLEScan* bleScan = nullptr;
 static unsigned long lastBleScanAt = 0;
 static WebServer webServer(AP_WEB_SERVER_PORT);
@@ -256,6 +283,16 @@ static size_t dedupeIdx = 0;
 
 // LED one-shot pulse timer
 static volatile unsigned long ledOffAt = 0;
+#if USE_RGB_LED
+static Adafruit_NeoPixel rgbLed(RGB_LED_COUNT, RGB_LED_PIN, NEO_GRB + NEO_KHZ800);
+static unsigned long rgbPulseStartedAt = 0;
+static unsigned long rgbPulseDurationMs = 0;
+static unsigned long rgbLastHeartbeatAt = 0;
+static uint8_t rgbPulseR = 0;
+static uint8_t rgbPulseG = 0;
+static uint8_t rgbPulseB = 0;
+static bool rgbPulseActive = false;
+#endif
 
 // Heartbeat audio state: last time any target was seen, last time the
 // heartbeat beep-pair was played. When nothing has been seen for
@@ -273,6 +310,7 @@ static uint8_t uiLastChannel = 0;
 static uint8_t uiLastConfidence = 0;
 static char uiLiveFeed[5][48] = {{0}};
 static bool uiDisplayReady = false;
+static bool uiTouchReady = false;
 static bool uiBuzzerMuted = false;
 static unsigned long uiLastRefreshAt = 0;
 static uint8_t uiPage = 0;
@@ -281,15 +319,50 @@ static uint8_t uiMenuIndex = 0;
 static const uint8_t uiMenuItems = 2;
 static unsigned long uiStatusUntilMs = 0;
 static char uiStatusLine[32] = "";
+#if USE_AMOLED_DISPLAY
+static bool amoledNeedsFullRedraw = true;
+static uint8_t amoledLastPage = 255;
+static bool amoledLastMenuMode = false;
+static uint8_t amoledLastMenuIndex = 255;
+static bool amoledLastStealthMode = false;
+static Arduino_DataBus* amoledBus = nullptr;
+static Arduino_SH8601* amoled = nullptr;
+static Adafruit_XCA9554 amoledExpander;
+static bool amoledExpanderReady = false;
+static std::shared_ptr<Arduino_IIC_DriveBus> touchBus;
+static std::unique_ptr<Arduino_FT3x68> touchDevice;
+static bool touchActive = false;
+static bool touchHoldSent = false;
+static unsigned long touchDownAt = 0;
+static unsigned long touchLastPollAt = 0;
+static int16_t touchDownX = -1;
+static int16_t touchDownY = -1;
+static int16_t touchLastX = -1;
+static int16_t touchLastY = -1;
+#else
 static Adafruit_SSD1306 display(OLED_W, OLED_H, &Wire, OLED_RESET);
 static U8G2_FOR_ADAFRUIT_GFX uiFonts;
+#endif
+
+#if ENABLE_POWER_STATUS
+static XPowersPMU powerPmu;
+static bool powerReady = false;
+static bool powerBatteryPresent = false;
+static bool powerCharging = false;
+static bool powerVbusPresent = false;
+static int powerBatteryPercent = -1;
+static uint16_t powerBatteryMv = 0;
+static uint16_t powerVbusMv = 0;
+static uint16_t powerSystemMv = 0;
+static unsigned long powerLastReadAt = 0;
+#endif
 
 static char serialCmdBuf[96] = "";
 static uint8_t serialCmdLen = 0;
 static bool serialSawCr = false;
 
 typedef struct ButtonState {
-  uint8_t pin;
+  int8_t pin;
   bool pressed;
   bool raw;
   unsigned long changedAt;
@@ -343,28 +416,93 @@ static void dualPrintln(const char* str) {
 
 static inline void ledSet(bool on) {
 #if USE_LED
+#if USE_RGB_LED
+  rgbLed.setPixelColor(0, on ? rgbLed.Color(RGB_RED_R, RGB_RED_G, RGB_RED_B) : 0);
+  rgbLed.show();
+#else
 #if LED_ACTIVE_HIGH
   digitalWrite(LED_PIN, on ? HIGH : LOW);
 #else
   digitalWrite(LED_PIN, on ? LOW  : HIGH);
 #endif
 #endif
+#endif
 }
+
+#if USE_RGB_LED
+static void rgbSetColor(uint8_t r, uint8_t g, uint8_t b) {
+  rgbLed.setPixelColor(0, rgbLed.Color(r, g, b));
+  rgbLed.show();
+}
+
+static void rgbStartPulse(uint8_t r, uint8_t g, uint8_t b, unsigned ms) {
+  rgbPulseR = r;
+  rgbPulseG = g;
+  rgbPulseB = b;
+  rgbPulseDurationMs = ms;
+  rgbPulseStartedAt = millis();
+  rgbPulseActive = true;
+}
+#endif
 
 static void ledFlash(unsigned ms) {
 #if USE_LED
+#if USE_RGB_LED
+  rgbStartPulse(RGB_RED_R, RGB_RED_G, RGB_RED_B, ms);
+  rgbSetColor(RGB_RED_R, RGB_RED_G, RGB_RED_B);
+  ledOffAt = millis() + ms;
+  if (ledOffAt == 0) ledOffAt = 1;  // avoid the "off" sentinel
+#else
   ledSet(true);
   ledOffAt = millis() + ms;
   if (ledOffAt == 0) ledOffAt = 1;  // avoid the "off" sentinel
+#endif
+#endif
+}
+
+static void ledBootPulse(unsigned ms) {
+#if USE_LED
+#if USE_RGB_LED
+  rgbStartPulse(RGB_GREEN_R, RGB_GREEN_G, RGB_GREEN_B, ms);
+  rgbSetColor(RGB_GREEN_R, RGB_GREEN_G, RGB_GREEN_B);
+#else
+  ledFlash(ms);
+#endif
 #endif
 }
 
 static void ledTick() {
 #if USE_LED
+#if USE_RGB_LED
+  unsigned long now = millis();
+  if (rgbPulseActive) {
+    unsigned long elapsed = now - rgbPulseStartedAt;
+    if (elapsed >= rgbPulseDurationMs) {
+      rgbPulseActive = false;
+      ledOffAt = 0;
+      rgbSetColor(0, 0, 0);
+    } else {
+      unsigned long half = rgbPulseDurationMs / 2;
+      if (half == 0) half = 1;
+      unsigned long phase = (elapsed <= half) ? elapsed : (rgbPulseDurationMs - elapsed);
+      uint8_t level = (uint8_t)((phase * 255UL) / half);
+      rgbSetColor((uint8_t)((rgbPulseR * level) / 255),
+                  (uint8_t)((rgbPulseG * level) / 255),
+                  (uint8_t)((rgbPulseB * level) / 255));
+    }
+    return;
+  }
+
+  if (now - rgbLastHeartbeatAt >= RGB_HEARTBEAT_MS) {
+    rgbLastHeartbeatAt = now;
+    rgbStartPulse(RGB_GREEN_R, RGB_GREEN_G, RGB_GREEN_B, RGB_PULSE_MS);
+  }
+#else
   if (ledOffAt && (long)(millis() - ledOffAt) >= 0) {
     ledSet(false);
     ledOffAt = 0;
   }
+#endif
 #endif
 }
 
@@ -1021,8 +1159,117 @@ static void lifetimeSave() {
   lastLifetimeSaveAt = millis();
 }
 
+#if ENABLE_SD_LOGGING
+static const char* sdCardTypeName(uint8_t cardType) {
+  switch (cardType) {
+    case CARD_MMC: return "MMC";
+    case CARD_SD: return "SDSC";
+    case CARD_SDHC: return "SDHC";
+    default: return "NONE";
+  }
+}
+
+static void sdSetStatus(const char* status) {
+  strlcpy(sdStatusLine, status, sizeof(sdStatusLine));
+}
+
+#if USE_SD_MMC
+static void sdMmcPreparePins() {
+  pinMode(SDMMC_CMD_PIN, INPUT_PULLUP);
+  pinMode(SDMMC_D0_PIN, INPUT_PULLUP);
+  pinMode(SDMMC_CLK_PIN, INPUT_PULLUP);
+}
+
+#if USE_AMOLED_DISPLAY
+static void sdMmcPrepareBoardPower() {
+  if (!amoledExpanderReady) return;
+  amoledExpander.pinMode(7, OUTPUT);
+  amoledExpander.digitalWrite(7, HIGH);
+  delay(200);
+  dualPrintln("[cypher-flock] SD_MMC expander enable high");
+}
+#endif
+
+static bool sdMmcMountAtFrequency(int frequency, const char* label) {
+  sdMmcPreparePins();
+  if (!SD_MMC.setPins(SDMMC_CLK_PIN, SDMMC_CMD_PIN, SDMMC_D0_PIN)) {
+    sdSetStatus("pin setup failed");
+    dualPrintf("[cypher-flock] SD_MMC pin setup failed (clk=%d cmd=%d d0=%d)\n",
+               SDMMC_CLK_PIN, SDMMC_CMD_PIN, SDMMC_D0_PIN);
+    return false;
+  }
+  if (SD_MMC.begin("/sdcard", true, false, frequency)) {
+    snprintf(sdStatusLine, sizeof(sdStatusLine), "mounted %s", label);
+    dualPrintf("[cypher-flock] SD_MMC mounted at %s\n", label);
+    return true;
+  }
+  dualPrintf("[cypher-flock] SD_MMC mount failed at %s\n", label);
+  SD_MMC.end();
+  return false;
+}
+#endif
+#endif
+
 static void storageInit() {
 #if ENABLE_SD_LOGGING
+  sdReady = false;
+  sdCardTypeValue = CARD_NONE;
+  sdCardSizeBytes = 0;
+  currentLogFile = "";
+  sdSetStatus("not initialized");
+#if USE_SD_MMC
+#if USE_AMOLED_DISPLAY
+  sdMmcPrepareBoardPower();
+#endif
+  if (!sdMmcMountAtFrequency(SDMMC_FREQ_HIGHSPEED, "40MHz") &&
+      !sdMmcMountAtFrequency(SDMMC_FREQ_DEFAULT, "20MHz") &&
+      !sdMmcMountAtFrequency(10000, "10MHz") &&
+      !sdMmcMountAtFrequency(SDMMC_FREQ_PROBING, "400kHz")) {
+    sdSetStatus("mount failed all freqs");
+    dualPrintf("[cypher-flock] SD_MMC mount failed (clk=%d cmd=%d d0=%d)\n",
+               SDMMC_CLK_PIN, SDMMC_CMD_PIN, SDMMC_D0_PIN);
+    return;
+  }
+
+  sdCardTypeValue = SD_MMC.cardType();
+  if (sdCardTypeValue == CARD_NONE) {
+    sdSetStatus("no card detected");
+    dualPrintln("[cypher-flock] SD_MMC mounted but no card was detected");
+    SD_MMC.end();
+    return;
+  }
+  sdCardSizeBytes = SD_MMC.cardSize();
+
+  for (int i = 1; i < 1000; i++) {
+    char path[24];
+    snprintf(path, sizeof(path), "/FlockLog_%03d.csv", i);
+    if (!SD_MMC.exists(path)) {
+      currentLogFile = path;
+      File f = SD_MMC.open(path, FILE_WRITE);
+      if (!f) {
+        sdSetStatus("write probe failed");
+        dualPrintf("[cypher-flock] SD_MMC write probe failed: %s\n", path);
+        SD_MMC.end();
+        return;
+      }
+      f.println("Uptime_ms,Date_Time,Channel,Capture_Type,Protocol,RSSI,MAC_Address,Device_Name,TX_Power,Detection_Method,Confidence,Confidence_Label,Extra_Data,Latitude,Longitude,Speed_MPH,Heading_Deg,Altitude_M");
+      f.close();
+      break;
+    }
+  }
+  if (currentLogFile.length() == 0) {
+    sdSetStatus("no log slot");
+    dualPrintln("[cypher-flock] SD_MMC no available log slot");
+    SD_MMC.end();
+    return;
+  }
+
+  sdReady = true;
+  sdSetStatus("ready");
+  dualPrintf("[cypher-flock] SD_MMC logging ready: %s type=%s size=%lluMB\n",
+             currentLogFile.c_str(), sdCardTypeName(sdCardTypeValue),
+             (unsigned long long)(sdCardSizeBytes / (1024ULL * 1024ULL)));
+#else
 #if defined(SD_MOSI_PIN) && defined(SD_MISO_PIN) && defined(SD_SCK_PIN) && (SD_MOSI_PIN >= 0) && (SD_MISO_PIN >= 0) && (SD_SCK_PIN >= 0)
   SPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
 #endif
@@ -1041,17 +1288,24 @@ static void storageInit() {
         break;
       }
     }
+    sdSetStatus("ready");
     dualPrintf("[cypher-flock] SD logging ready: %s\n", currentLogFile.c_str());
   } else {
+    sdSetStatus("mount failed");
     dualPrintln("[cypher-flock] SD init skipped/failed");
   }
+#endif
 #endif
 }
 
 static void storageLogDetection(const FYDetection& d) {
 #if ENABLE_SD_LOGGING
   if (!sdReady) return;
+#if USE_SD_MMC
+  File f = SD_MMC.open(currentLogFile.c_str(), FILE_APPEND);
+#else
   File f = SD.open(currentLogFile.c_str(), FILE_APPEND);
+#endif
   if (!f) return;
   f.printf("%lu,%lu,%u,%s,%s,%d,%s,%s,%d,%s,%u,%s,%s,,,,,\n",
            (unsigned long)millis(), (unsigned long)millis(), (unsigned)d.channel,
@@ -1639,6 +1893,10 @@ static String jsonFileList(fs::FS& fs, const char* prefix) {
   return out;
 }
 
+#if ENABLE_POWER_STATUS
+static void powerRead(bool force = false);
+#endif
+
 static void webInit() {
   WiFi.mode(WIFI_AP);
   WiFi.softAP(AP_SSID, AP_PASSWORD, AP_CHANNEL);
@@ -1651,7 +1909,11 @@ static void webInit() {
     body += jsonFileList(SPIFFS, "littlefs");
 #if ENABLE_SD_LOGGING
     if (sdReady) {
+#if USE_SD_MMC
+      String sd = jsonFileList(SD_MMC, "sd");
+#else
       String sd = jsonFileList(SD, "sd");
+#endif
       if (body[body.length() - 1] != '[' && sd.length()) body += ",";
       body += sd;
     }
@@ -1673,6 +1935,16 @@ static void webInit() {
     body += "false";
 #endif
     body += ",\"free_heap\":" + String((unsigned long)ESP.getFreeHeap());
+#if ENABLE_POWER_STATUS
+    powerRead();
+    body += ",\"power_ready\":";
+    body += powerReady ? "true" : "false";
+    body += ",\"battery_percent\":" + String(powerBatteryPercent);
+    body += ",\"battery_charging\":";
+    body += powerCharging ? "true" : "false";
+    body += ",\"vbus_present\":";
+    body += powerVbusPresent ? "true" : "false";
+#endif
     body += "}";
     webServer.send(200, "application/json", body);
   });
@@ -1694,7 +1966,11 @@ static void webInit() {
 #if ENABLE_SD_LOGGING
     else if (rest.startsWith("sd")) {
       rest = rest.substring(strlen("sd"));
+#if USE_SD_MMC
+      fsPtr = &SD_MMC;
+#else
       fsPtr = &SD;
+#endif
     }
 #endif
     if (!rest.startsWith("/")) rest = "/" + rest;
@@ -1711,7 +1987,230 @@ static void webInit() {
   dualPrintf("[cypher-flock] AP webserver ready: ssid=%s ip=%s\n", AP_SSID, WiFi.softAPIP().toString().c_str());
 }
 
+static void uiFitText(char* out, size_t outLen, const char* in, uint8_t maxChars) {
+  if (!outLen) return;
+  if (!in || !in[0]) {
+    strlcpy(out, "-", outLen);
+    return;
+  }
+  strlcpy(out, in, outLen);
+  if (strlen(out) <= maxChars) return;
+  if (maxChars < 2) {
+    out[0] = '\0';
+    return;
+  }
+  out[maxChars - 1] = '~';
+  out[maxChars] = '\0';
+}
+
+#if USE_AMOLED_DISPLAY
+static const uint16_t AMOLED_BLACK = 0x0000;
+static const uint16_t AMOLED_WHITE = 0xFFFF;
+static const uint16_t AMOLED_DIM = 0x7BEF;
+static const uint16_t AMOLED_PANEL = 0x1082;
+static const uint16_t AMOLED_ACCENT = 0x07FF;
+static const uint16_t AMOLED_WARN = 0xFD20;
+static const uint16_t AMOLED_DANGER = 0xF800;
+static const uint16_t AMOLED_OK = 0x07E0;
+
+static void amoledText(int16_t x, int16_t y, const char* text, uint8_t size = 2,
+                       uint16_t color = AMOLED_WHITE, uint16_t bg = AMOLED_BLACK) {
+  if (!amoled) return;
+  amoled->setTextSize(size);
+  amoled->setTextColor(color, bg);
+  amoled->setCursor(x, y);
+  amoled->print(text);
+}
+
+static void amoledPrintf(int16_t x, int16_t y, uint8_t size, uint16_t color, const char* fmt, ...) {
+  char buf[72];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, args);
+  va_end(args);
+  amoledText(x, y, buf, size, color);
+}
+
+static void powerRead(bool force) {
+#if ENABLE_POWER_STATUS
+  unsigned long now = millis();
+  if (!force && now - powerLastReadAt < 2500) return;
+  powerLastReadAt = now;
+  if (!powerReady) return;
+  powerBatteryPresent = powerPmu.isBatteryConnect();
+  powerCharging = powerPmu.isCharging();
+  powerVbusPresent = powerPmu.isVbusIn();
+  powerBatteryMv = powerPmu.getBattVoltage();
+  powerVbusMv = powerPmu.getVbusVoltage();
+  powerSystemMv = powerPmu.getSystemVoltage();
+  powerBatteryPercent = powerBatteryPresent ? powerPmu.getBatteryPercent() : -1;
+#else
+  (void)force;
+#endif
+}
+
+static void powerLabel(char* out, size_t outLen) {
+  if (!outLen) return;
+#if ENABLE_POWER_STATUS
+  powerRead();
+  if (!powerReady) strlcpy(out, "BAT?", outLen);
+  else if (powerBatteryPresent && powerBatteryPercent >= 0) {
+    snprintf(out, outLen, powerCharging ? "%d%% CHG" : "%d%%", powerBatteryPercent);
+  } else if (powerVbusPresent) strlcpy(out, "USB", outLen);
+  else strlcpy(out, "BAT?", outLen);
+#else
+  strlcpy(out, "", outLen);
+#endif
+}
+
+static void amoledHeader(const char* title, bool fullRedraw) {
+  if (fullRedraw) {
+    amoled->fillRect(0, 0, AMOLED_W, 92, AMOLED_BLACK);
+    amoled->drawFastHLine(14, 47, AMOLED_W - 28, AMOLED_DIM);
+    int16_t titleX = (int16_t)((AMOLED_W - (int)strlen(title) * 18) / 2);
+    amoledText(titleX < 14 ? 14 : titleX, 14, title, 3, AMOLED_WHITE);
+  }
+  char pwr[16];
+  powerLabel(pwr, sizeof(pwr));
+  amoled->fillRect(214, 52, 140, 30, AMOLED_BLACK);
+  if (pwr[0]) {
+    int16_t badgeW = (int16_t)strlen(pwr) * 12;
+    int16_t badgeX = AMOLED_W - badgeW - 18;
+    if (badgeX < 214) badgeX = 214;
+    amoled->drawRoundRect(badgeX - 8, 52, badgeW + 16, 28, 6, AMOLED_OK);
+    amoledText(badgeX, 59, pwr, 2, AMOLED_OK);
+  }
+}
+
+static void amoledFooter(unsigned long now) {
+  amoled->fillRect(0, AMOLED_H - 50, AMOLED_W, 50, AMOLED_BLACK);
+  amoled->drawFastHLine(14, AMOLED_H - 48, AMOLED_W - 28, AMOLED_DIM);
+  char line[44];
+  if (uiMenuMode) {
+    snprintf(line, sizeof(line), "MENU %s  swipe edits", (uiMenuIndex == 0) ? "CH" : "BUZZ");
+  } else if (uiStatusUntilMs > now) {
+    uiFitText(line, sizeof(line), uiStatusLine, 40);
+  } else {
+    snprintf(line, sizeof(line), "%s Ch%u %s", sniffingPaused ? "PAUSED" : "SCAN", currentChannel, channelModeName());
+  }
+  amoledText(18, AMOLED_H - 32, line, 2, AMOLED_DIM);
+  amoledPrintf(AMOLED_W - 54, AMOLED_H - 32, 2, AMOLED_DIM, "%u/7", (unsigned)(uiPage + 1));
+}
+
+static void amoledPill(int16_t x, int16_t y, const char* label, bool active) {
+  int16_t w = (int16_t)(strlen(label) * 12 + 18);
+  uint16_t color = active ? AMOLED_ACCENT : AMOLED_DIM;
+  amoled->drawRoundRect(x, y, w, 28, 6, color);
+  if (active) amoled->fillRoundRect(x + 2, y + 2, w - 4, 24, 5, 0x0228);
+  amoledText(x + 9, y + 7, label, 2, color);
+}
+
+static void amoledBar(int16_t x, int16_t y, int16_t w, int16_t h, uint8_t pct, uint16_t color) {
+  pct = constrain(pct, 0, 100);
+  amoled->drawRoundRect(x, y, w, h, 4, AMOLED_DIM);
+  int16_t fill = (int16_t)((w - 6) * pct / 100);
+  if (fill > 0) amoled->fillRoundRect(x + 3, y + 3, fill, h - 6, 3, color);
+}
+
+static void amoledMetric(int16_t x, int16_t y, const char* label, unsigned long value, uint16_t color) {
+  amoledText(x, y, label, 2, AMOLED_DIM);
+  amoledPrintf(x, y + 28, 4, color, "%lu", value);
+}
+
+static void amoledRemapTouch(int32_t rawX, int32_t rawY, int16_t& outX, int16_t& outY) {
+  int32_t x = rawY;
+  int32_t y = (AMOLED_H - 1) - rawX;
+  outX = (int16_t)constrain(x, 0, AMOLED_W - 1);
+  outY = (int16_t)constrain(y, 0, AMOLED_H - 1);
+}
+
+static void touchInit() {
+#if USE_TOUCH_INPUT
+  touchBus = std::make_shared<Arduino_HWIIC>(TOUCH_SDA_PIN, TOUCH_SCL_PIN, &Wire);
+  touchDevice.reset(new Arduino_FT3x68(touchBus, FT3168_DEVICE_ADDRESS, DRIVEBUS_DEFAULT_VALUE, TOUCH_INT_PIN));
+  for (uint8_t i = 0; i < 5; i++) {
+    if (touchDevice->begin()) {
+      touchDevice->IIC_Write_Device_State(touchDevice->Arduino_IIC_Touch::Device::TOUCH_POWER_MODE,
+                                          touchDevice->Arduino_IIC_Touch::Device_Mode::TOUCH_POWER_MONITOR);
+      uiTouchReady = true;
+      dualPrintf("[cypher-flock] FT3168 touch init ok id=0x%X\n",
+                 (unsigned)touchDevice->IIC_Read_Device_ID());
+      return;
+    }
+    dualPrintln("[cypher-flock] FT3168 touch init retry");
+    delay(250);
+  }
+  dualPrintln("[cypher-flock] FT3168 touch init failed");
+#endif
+}
+
+static void powerInit() {
+#if ENABLE_POWER_STATUS
+  powerReady = powerPmu.begin(Wire, AXP2101_SLAVE_ADDRESS, TOUCH_SDA_PIN, TOUCH_SCL_PIN);
+  if (!powerReady) {
+    dualPrintln("[cypher-flock] AXP2101 PMIC unavailable");
+    return;
+  }
+  powerPmu.enableBattDetection();
+  powerPmu.enableBattVoltageMeasure();
+  powerPmu.enableVbusVoltageMeasure();
+  powerPmu.enableSystemVoltageMeasure();
+  powerRead(true);
+  dualPrintf("[cypher-flock] AXP2101 PMIC init ok id=0x%X\n", (unsigned)powerPmu.getChipID());
+#endif
+}
+#endif
+
 static void displayInit() {
+#if USE_AMOLED_DISPLAY
+  dualPrintln("[cypher-flock] AMOLED displayInit begin");
+  Wire.begin(TOUCH_SDA_PIN, TOUCH_SCL_PIN);
+  Wire.setClock(400000);
+  dualPrintf("[cypher-flock] I2C begin sda=%d scl=%d\n", TOUCH_SDA_PIN, TOUCH_SCL_PIN);
+
+  dualPrintln("[cypher-flock] probing AMOLED XCA9554 expander");
+  if (!amoledExpander.begin(0x20, &Wire)) {
+    amoledExpanderReady = false;
+    dualPrintln("[cypher-flock] AMOLED XCA9554 not found; trying SH8601 anyway");
+  } else {
+    amoledExpanderReady = true;
+    for (uint8_t pin = 0; pin < 3; pin++) {
+      amoledExpander.pinMode(pin, OUTPUT);
+      amoledExpander.digitalWrite(pin, LOW);
+    }
+    amoledExpander.pinMode(7, OUTPUT);
+    amoledExpander.digitalWrite(7, LOW);
+    delay(200);
+    for (uint8_t pin = 0; pin < 3; pin++) amoledExpander.digitalWrite(pin, HIGH);
+    amoledExpander.digitalWrite(7, HIGH);
+    dualPrintln("[cypher-flock] AMOLED XCA9554 init ok; SD enable high");
+  }
+
+  dualPrintln("[cypher-flock] creating SH8601 QSPI bus");
+  amoledBus = new Arduino_ESP32QSPI(LCD_CS, LCD_SCLK, LCD_SDIO0, LCD_SDIO1, LCD_SDIO2, LCD_SDIO3);
+  amoled = new Arduino_SH8601(amoledBus, LCD_RST, AMOLED_ROTATION, AMOLED_W, AMOLED_H);
+  dualPrintln("[cypher-flock] starting SH8601");
+  uiDisplayReady = amoled->begin();
+  if (!uiDisplayReady) {
+    dualPrintln("[cypher-flock] SH8601 init FAILED");
+    return;
+  }
+  dualPrintln("[cypher-flock] SH8601 init ok");
+  amoled->setBrightness(AMOLED_BRIGHTNESS);
+  amoled->fillScreen(AMOLED_BLACK);
+  dualPrintln("[cypher-flock] AMOLED splash drawing");
+  powerInit();
+  touchInit();
+
+  amoled->drawRoundRect(20, 36, AMOLED_W - 40, AMOLED_H - 72, 18, AMOLED_ACCENT);
+  amoledText(55, 128, "CYPHER", 4, AMOLED_WHITE);
+  amoledText(55, 178, "FLOCK", 4, AMOLED_ACCENT);
+  amoledText(55, 250, "passive detector", 2, AMOLED_DIM);
+  char pwr[16];
+  powerLabel(pwr, sizeof(pwr));
+  amoledPrintf(55, 282, 2, AMOLED_OK, "touch %s  power %s", uiTouchReady ? "ok" : "off", pwr);
+  delay(5000);
+#else
   Wire.begin(OLED_SDA_PIN, OLED_SCL_PIN);
   Wire.setClock(100000);
 
@@ -1774,27 +2273,140 @@ static void displayInit() {
   uiFonts.drawStr(14, 56, "detect flock cameras");
   display.display();
   delay(5000);
-}
-
-static void buttonsInit() {
-#if BTN_USE_PULLUPS
-  pinMode(BTN_UP_PIN, INPUT_PULLUP);
-  pinMode(BTN_DOWN_PIN, INPUT_PULLUP);
-  pinMode(BTN_SELECT_PIN, INPUT_PULLUP);
-#else
-  pinMode(BTN_UP_PIN, INPUT);
-  pinMode(BTN_DOWN_PIN, INPUT);
-  pinMode(BTN_SELECT_PIN, INPUT);
 #endif
 }
 
-static bool buttonRawPressed(uint8_t pin) {
+static void buttonsInit() {
+#if BTN_UP_PIN >= 0
+#if BTN_USE_PULLUPS
+  pinMode(BTN_UP_PIN, INPUT_PULLUP);
+#else
+  pinMode(BTN_UP_PIN, INPUT);
+#endif
+#endif
+#if BTN_DOWN_PIN >= 0
+#if BTN_USE_PULLUPS
+  pinMode(BTN_DOWN_PIN, INPUT_PULLUP);
+#else
+  pinMode(BTN_DOWN_PIN, INPUT);
+#endif
+#endif
+#if BTN_SELECT_PIN >= 0
+#if BTN_USE_PULLUPS
+  pinMode(BTN_SELECT_PIN, INPUT_PULLUP);
+#else
+  pinMode(BTN_SELECT_PIN, INPUT);
+#endif
+#endif
+}
+
+static bool buttonRawPressed(int8_t pin) {
+  if (pin < 0) return false;
   return digitalRead(pin) == BTN_ACTIVE_STATE;
 }
+
+static void applyUiChange(int delta);
+static void cycleChannelModeFromButton() {
+  uint8_t nextMode = runtimeChannelMode + 1;
+  if (nextMode > CHANNEL_MODE_SINGLE) nextMode = CHANNEL_MODE_FULL_HOP;
+  runtimeChannelMode = nextMode;
+  applyInitialChannel();
+  snprintf(uiStatusLine, sizeof(uiStatusLine), "mode: %s", channelModeName());
+  uiStatusUntilMs = millis() + 1400;
+#if USE_AMOLED_DISPLAY
+  amoledNeedsFullRedraw = true;
+#endif
+}
+
+#if USE_AMOLED_DISPLAY
+static void touchToggleStealth() {
+  stealthMode = !stealthMode;
+  uiBuzzerMuted = stealthMode;
+  strlcpy(uiStatusLine, stealthMode ? "stealth on" : "stealth off", sizeof(uiStatusLine));
+  uiStatusUntilMs = millis() + 1200;
+  amoledNeedsFullRedraw = true;
+  if (stealthMode && uiDisplayReady && amoled) amoled->fillScreen(AMOLED_BLACK);
+}
+
+static void touchHandleTap(int16_t x, int16_t y) {
+  if (y >= AMOLED_H - 82) {
+    uint8_t tab = constrain(x / (AMOLED_W / 4), 0, 3);
+    const uint8_t tabPages[] = {0, 2, 3, 6};
+    uiPage = tabPages[tab];
+    strlcpy(uiStatusLine, "tap page change", sizeof(uiStatusLine));
+    uiStatusUntilMs = millis() + 1200;
+    amoledNeedsFullRedraw = true;
+  } else if (y < 62 && x > AMOLED_W - 110) {
+    touchToggleStealth();
+  } else if (uiMenuMode) {
+    applyUiChange(1);
+  }
+}
+
+static void touchHandleSwipe(int16_t dx, int16_t dy) {
+  if (abs(dx) > abs(dy)) {
+    uiPage = (uint8_t)((uiPage + (dx < 0 ? 1 : 6)) % 7);
+    strlcpy(uiStatusLine, "swipe page change", sizeof(uiStatusLine));
+    uiStatusUntilMs = millis() + 1200;
+    amoledNeedsFullRedraw = true;
+    return;
+  }
+  if (uiPage == 3) {
+    strlcpy(uiStatusLine, dy < 0 ? "feed scroll down" : "feed scroll up", sizeof(uiStatusLine));
+    uiStatusUntilMs = millis() + 1000;
+  } else if (uiMenuMode) {
+    applyUiChange(dy < 0 ? 1 : -1);
+  }
+}
+
+static void touchPoll() {
+  if (!uiTouchReady || !touchDevice) return;
+  unsigned long now = millis();
+  if (now - touchLastPollAt < 24) return;
+  touchLastPollAt = now;
+
+  int32_t fingers = touchDevice->IIC_Read_Device_Value(touchDevice->Arduino_IIC_Touch::Value_Information::TOUCH_FINGER_NUMBER);
+  if (fingers > 0) {
+    int32_t rawX = touchDevice->IIC_Read_Device_Value(touchDevice->Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_X);
+    int32_t rawY = touchDevice->IIC_Read_Device_Value(touchDevice->Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_Y);
+    int16_t x = 0;
+    int16_t y = 0;
+    amoledRemapTouch(rawX, rawY, x, y);
+    if (!touchActive) {
+      touchActive = true;
+      touchHoldSent = false;
+      touchDownAt = now;
+      touchDownX = touchLastX = x;
+      touchDownY = touchLastY = y;
+      return;
+    }
+    int16_t dx = x - touchDownX;
+    int16_t dy = y - touchDownY;
+    if (!touchHoldSent && now - touchDownAt > BTN_LONGPRESS_MS && abs(dx) < 38 && abs(dy) < 38) {
+      touchHoldSent = true;
+      touchToggleStealth();
+    }
+    touchLastX = x;
+    touchLastY = y;
+    return;
+  }
+
+  if (!touchActive) return;
+  touchActive = false;
+  int16_t dx = touchLastX - touchDownX;
+  int16_t dy = touchLastY - touchDownY;
+  if (touchHoldSent) return;
+  if (abs(dx) > 46 || abs(dy) > 46) touchHandleSwipe(dx, dy);
+  else touchHandleTap(touchLastX, touchLastY);
+}
+#endif
 
 static void applyUiChange(int delta) {
   if (!uiMenuMode) {
     uiPage = (uint8_t)((uiPage + (delta > 0 ? 1 : 6)) % 7);
+#if USE_AMOLED_DISPLAY
+    amoledNeedsFullRedraw = true;
+#endif
     return;
   }
   if (uiMenuIndex == 0) {
@@ -1805,6 +2417,9 @@ static void applyUiChange(int delta) {
     applyInitialChannel();
     strlcpy(uiStatusLine, "channel mode updated", sizeof(uiStatusLine));
     uiStatusUntilMs = millis() + 1200;
+#if USE_AMOLED_DISPLAY
+    amoledNeedsFullRedraw = true;
+#endif
   } else {
     uiBuzzerMuted = (delta > 0) ? true : false;
     strlcpy(uiStatusLine, uiBuzzerMuted ? "buzzer muted" : "buzzer unmuted", sizeof(uiStatusLine));
@@ -1818,6 +2433,9 @@ static void onShortPress(ButtonState* b) {
   } else if (b->pin == BTN_DOWN_PIN) {
     applyUiChange(-1);
   } else if (b->pin == BTN_SELECT_PIN) {
+#if USE_AMOLED_DISPLAY
+    cycleChannelModeFromButton();
+#else
     if (!uiMenuMode) {
       uiMenuMode = true;
       uiMenuIndex = 0;
@@ -1833,6 +2451,7 @@ static void onShortPress(ButtonState* b) {
       }
     }
     uiStatusUntilMs = millis() + 1200;
+#endif
   }
 }
 
@@ -1842,10 +2461,15 @@ static void onLongPress(ButtonState* b) {
     uiBuzzerMuted = stealthMode;
     strlcpy(uiStatusLine, stealthMode ? "stealth on" : "stealth off", sizeof(uiStatusLine));
     uiStatusUntilMs = millis() + 1200;
+#if USE_AMOLED_DISPLAY
+    amoledNeedsFullRedraw = true;
+    if (stealthMode && uiDisplayReady && amoled) amoled->fillScreen(AMOLED_BLACK);
+#else
     if (stealthMode && uiDisplayReady) {
       display.clearDisplay();
       display.display();
     }
+#endif
   }
 }
 
@@ -1870,11 +2494,123 @@ static void pollButton(ButtonState* b) {
 }
 
 static void buttonsPoll() {
+#if BTN_UP_PIN >= 0
   pollButton(&btnUp);
+#endif
+#if BTN_DOWN_PIN >= 0
   pollButton(&btnDown);
+#endif
+#if BTN_SELECT_PIN >= 0
   pollButton(&btnSelect);
+#endif
+#if USE_AMOLED_DISPLAY
+  touchPoll();
+#endif
 }
 
+#if USE_AMOLED_DISPLAY
+static void displayRender() {
+  if (!uiDisplayReady || !amoled || stealthMode) return;
+  unsigned long now = millis();
+  if (now - uiLastRefreshAt < AMOLED_REFRESH_MS) return;
+  uiLastRefreshAt = now;
+
+  bool fullRedraw = amoledNeedsFullRedraw ||
+                    amoledLastPage != uiPage ||
+                    amoledLastMenuMode != uiMenuMode ||
+                    amoledLastMenuIndex != uiMenuIndex ||
+                    amoledLastStealthMode != stealthMode;
+  amoledNeedsFullRedraw = false;
+  amoledLastPage = uiPage;
+  amoledLastMenuMode = uiMenuMode;
+  amoledLastMenuIndex = uiMenuIndex;
+  amoledLastStealthMode = stealthMode;
+
+  if (fullRedraw) amoled->fillScreen(AMOLED_BLACK);
+  amoledHeader("CYPHER FLOCK", fullRedraw);
+  amoled->fillRect(0, 86, AMOLED_W, AMOLED_H - 136, AMOLED_BLACK);
+  const int16_t yOff = 24;
+
+  if (uiPage == 0) {
+    amoledMetric(24, 78 + yOff, "WiFi", (unsigned long)sessionWifi, AMOLED_ACCENT);
+    amoledMetric(142, 78 + yOff, "BLE", (unsigned long)sessionBle, AMOLED_OK);
+    amoledMetric(250, 78 + yOff, "Raven", (unsigned long)sessionRaven, AMOLED_WARN);
+    amoledPill(24, 178 + yOff, "AP", apReady);
+    amoledPill(86, 178 + yOff, "SD", sdReady);
+#if ENABLE_GPS
+    amoledPill(148, 178 + yOff, "GPS", gps.location.isValid());
+#else
+    amoledPill(148, 178 + yOff, "GPS", false);
+#endif
+    amoledPrintf(24, 242 + yOff, 2, AMOLED_DIM, "Queue drops: %lu", (unsigned long)alertQueueDrops);
+    amoledPrintf(24, 278 + yOff, 2, AMOLED_DIM, "Heap: %lu", (unsigned long)ESP.getFreeHeap());
+  } else if (uiPage == 1) {
+    amoledText(24, 76 + yOff, "Type        Session      Total", 2, AMOLED_DIM);
+    amoledPrintf(24, 126 + yOff, 2, AMOLED_WHITE, "WiFi        %6lu   %8lu", (unsigned long)sessionWifi, (unsigned long)(lifetimeWifi + sessionWifi));
+    amoledPrintf(24, 166 + yOff, 2, AMOLED_WHITE, "BLE         %6lu   %8lu", (unsigned long)sessionBle, (unsigned long)(lifetimeBle + sessionBle));
+    amoledPrintf(24, 206 + yOff, 2, AMOLED_WHITE, "Raven       %6lu   %8lu", (unsigned long)sessionRaven, (unsigned long)(lifetimeRaven + sessionRaven));
+  } else if (uiPage == 2) {
+    char method[32];
+    uiFitText(method, sizeof(method), uiLastMethod[0] ? uiLastMethod : "waiting for detection", 30);
+    amoledText(24, 78 + yOff, method, 2, AMOLED_ACCENT);
+    amoledText(24, 126 + yOff, uiLastMac[0] ? uiLastMac : "--:--:--:--:--:--", 3, AMOLED_WHITE);
+    amoledPrintf(24, 190 + yOff, 2, AMOLED_DIM, "%s  %u%%  %ddBm  Ch%u",
+                 uiLastConfidenceLabel, (unsigned)uiLastConfidence, uiLastRssi, (unsigned)uiLastChannel);
+    amoledBar(24, 232 + yOff, 320, 24, uiLastConfidence, AMOLED_ACCENT);
+  } else if (uiPage == 3) {
+    amoledText(24, 72 + yOff, "Live Feed", 3, AMOLED_ACCENT);
+    for (uint8_t i = 0; i < 5; i++) {
+      char row[42];
+      uiFitText(row, sizeof(row), uiLiveFeed[i][0] ? uiLiveFeed[i] : "waiting...", 39);
+      amoledPrintf(24, 124 + yOff + i * 44, 2, i == 0 ? AMOLED_WHITE : AMOLED_DIM, "%u  %s", (unsigned)(i + 1), row);
+    }
+  } else if (uiPage == 4) {
+    amoledText(24, 72 + yOff, "GPS / Storage", 3, AMOLED_ACCENT);
+#if ENABLE_GPS
+    if (gps.location.isValid()) {
+      amoledPrintf(24, 128 + yOff, 2, AMOLED_WHITE, "Lat %.5f", gps.location.lat());
+      amoledPrintf(24, 166 + yOff, 2, AMOLED_WHITE, "Lon %.5f", gps.location.lng());
+      amoledPrintf(24, 204 + yOff, 2, AMOLED_DIM, "Sat %u  %.1fmph", gps.satellites.value(), gps.speed.mph());
+    } else {
+      amoledText(24, 128 + yOff, "GPS waiting for NMEA", 2, AMOLED_DIM);
+    }
+#else
+    amoledText(24, 128 + yOff, "GPS not compiled", 2, AMOLED_DIM);
+#endif
+    char sdLine[42];
+#if ENABLE_SD_LOGGING
+    uiFitText(sdLine, sizeof(sdLine), sdReady ? currentLogFile.c_str() : sdStatusLine, 34);
+#else
+    strlcpy(sdLine, "not compiled", sizeof(sdLine));
+#endif
+    amoledPrintf(24, 230 + yOff, 2, sdReady ? AMOLED_OK : AMOLED_WARN, "SD: %s", sdLine);
+    amoledPrintf(24, 268 + yOff, 2, fySpiffsReady ? AMOLED_OK : AMOLED_WARN, "LittleFS: %s", fySpiffsReady ? "ready" : "off");
+  } else if (uiPage == 5) {
+    amoledText(24, 72 + yOff, "Activity", 3, AMOLED_ACCENT);
+    amoled->drawRoundRect(24, 124 + yOff, 320, 184, 8, AMOLED_DIM);
+    for (uint8_t i = 0; i < 25; i++) {
+      uint8_t idx = (activityBucketIndex + i + 1) % 25;
+      uint8_t h = min((uint32_t)150, activityBuckets[idx] * 12);
+      int16_t x = 36 + i * 12;
+      amoled->fillRect(x, 288 + yOff - h, 7, h, AMOLED_ACCENT);
+    }
+    amoledText(34, 318 + yOff, "last 25 seconds", 2, AMOLED_DIM);
+  } else {
+    int rssiPct = map(constrain(uiLastRssi, -95, -35), -95, -35, 0, 100);
+    amoledText(24, 72 + yOff, "Proximity", 3, AMOLED_ACCENT);
+    amoledPrintf(24, 130 + yOff, 3, AMOLED_WHITE, "%d dBm", uiLastRssi);
+    amoledBar(24, 188 + yOff, 320, 30, (uint8_t)rssiPct, rssiPct > 65 ? AMOLED_DANGER : AMOLED_ACCENT);
+    amoledPrintf(24, 248 + yOff, 2, AMOLED_DIM, "%s %u%%", uiLastConfidenceLabel, (unsigned)uiLastConfidence);
+    amoledPrintf(24, 286 + yOff, 2, AMOLED_DIM, "Stealth %s", stealthMode ? "ON" : "OFF");
+  }
+
+  if (uiMenuMode) {
+    amoled->drawRoundRect(18, 336, 332, 48, 8, AMOLED_WARN);
+    amoledPrintf(32, 352, 2, AMOLED_WARN, "Menu: %s", uiMenuIndex == 0 ? "channel mode" : "buzzer");
+  }
+  amoledFooter(now);
+}
+#else
 static void uiSetFontSmall(uint16_t color = SSD1306_WHITE) {
   uiFonts.setFontMode(1);
   uiFonts.setFontDirection(0);
@@ -1902,22 +2638,6 @@ static void uiPrintf(int16_t x, int16_t y, const char* fmt, ...) {
   vsnprintf(buf, sizeof(buf), fmt, args);
   va_end(args);
   uiText(x, y, buf);
-}
-
-static void uiFitText(char* out, size_t outLen, const char* in, uint8_t maxChars) {
-  if (!outLen) return;
-  if (!in || !in[0]) {
-    strlcpy(out, "-", outLen);
-    return;
-  }
-  strlcpy(out, in, outLen);
-  if (strlen(out) <= maxChars) return;
-  if (maxChars < 2) {
-    out[0] = '\0';
-    return;
-  }
-  out[maxChars - 1] = '~';
-  out[maxChars] = '\0';
 }
 
 static void uiHeader(const char* title) {
@@ -2057,6 +2777,7 @@ static void displayRender() {
   uiFooter(now);
   display.display();
 }
+#endif
 
 // ============================================================
 // SERIAL COMMAND FALLBACK
@@ -2136,6 +2857,19 @@ static void serialPrintStatus() {
             uiDisplayReady ? "ready" : "not-ready",
             stealthMode ? "on" : "off",
             uiBuzzerMuted ? "muted" : "on");
+#if ENABLE_POWER_STATUS
+  powerRead(true);
+  cmdPrintf("power=%s battery=%s percent=%d charging=%s vbus=%s batt_mv=%u vbus_mv=%u sys_mv=%u touch=%s",
+            powerReady ? "ready" : "not-ready",
+            powerBatteryPresent ? "present" : "missing",
+            powerBatteryPercent,
+            powerCharging ? "yes" : "no",
+            powerVbusPresent ? "yes" : "no",
+            (unsigned)powerBatteryMv,
+            (unsigned)powerVbusMv,
+            (unsigned)powerSystemMv,
+            uiTouchReady ? "ready" : "not-ready");
+#endif
 }
 
 static void serialPrintPage() {
@@ -2232,10 +2966,14 @@ static void serialSetStealth(const char* arg) {
   if (argEquals(arg, "on")) {
     stealthMode = true;
     uiBuzzerMuted = true;
+#if USE_AMOLED_DISPLAY
+    if (uiDisplayReady && amoled) amoled->fillScreen(AMOLED_BLACK);
+#else
     if (uiDisplayReady) {
       display.clearDisplay();
       display.display();
     }
+#endif
   } else if (argEquals(arg, "off")) {
     stealthMode = false;
   } else {
@@ -2266,7 +3004,10 @@ static void serialPrintStorage() {
   cmdPrintf("littlefs=%s detections=%d dirty=%s last_save_count=%d",
             fySpiffsReady ? "ready" : "off", fyDetCount, fyDirty ? "yes" : "no", fyLastSaveCount);
 #if ENABLE_SD_LOGGING
-  cmdPrintf("sd=compiled ready=%s log=%s", sdReady ? "yes" : "no", currentLogFile.c_str());
+  cmdPrintf("sd=compiled ready=%s status=\"%s\" type=%s size_mb=%llu log=%s",
+            sdReady ? "yes" : "no", sdStatusLine, sdCardTypeName(sdCardTypeValue),
+            (unsigned long long)(sdCardSizeBytes / (1024ULL * 1024ULL)),
+            currentLogFile.length() ? currentLogFile.c_str() : "-");
 #else
   cmdPrintf("sd=not-compiled");
 #endif
@@ -2395,7 +3136,15 @@ static void serialCommandTick() {
 
 void setup() {
   Serial.begin(115200);
+#if USE_AMOLED_DISPLAY
+  unsigned long serialWaitStart = millis();
+  while (!Serial && millis() - serialWaitStart < USB_SERIAL_WAIT_MS) delay(10);
+#endif
   delay(300);
+  dualPrintln("[cypher-flock] setup begin");
+  dualPrintf("[cypher-flock] profile=%s chip=%s heap=%lu psram=%lu\n",
+             PROFILE_NAME, ESP.getChipModel(), (unsigned long)ESP.getFreeHeap(),
+             (unsigned long)ESP.getPsramSize());
 
 #if MIRROR_SERIAL
   Serial1.begin(MIRROR_BAUD, SERIAL_8N1, -1, MIRROR_TX_PIN);  // TX-only on GPIO43
@@ -2407,21 +3156,30 @@ void setup() {
 #endif
 
 #if USE_LED
+#if USE_RGB_LED
+  rgbLed.begin();
+  rgbLed.setBrightness(255);
+  ledSet(false);
+#else
   pinMode(LED_PIN, OUTPUT);
   ledSet(false);
+#endif
 #endif
 
   startupBeep();
 #if USE_LED
-  ledFlash(200);
+  ledBootPulse(200);
 #endif
 
   precompileOuis();
   memset(dedupeTable, 0, sizeof(dedupeTable));
   buttonsInit();
+  dualPrintln("[cypher-flock] before displayInit");
   displayInit();
+  dualPrintln("[cypher-flock] after displayInit");
 
   // SPIFFS — format on first boot if missing. Non-fatal if it fails.
+  dualPrintln("[cypher-flock] before LittleFS");
   if (SPIFFS.begin(true)) {
     fySpiffsReady = true;
     dualPrintln("[cypher-flock] LittleFS ready");
@@ -2430,7 +3188,9 @@ void setup() {
   } else {
     dualPrintln("[cypher-flock] LittleFS init FAILED - running without persistence");
   }
+  dualPrintln("[cypher-flock] before storageInit");
   storageInit();
+  dualPrintln("[cypher-flock] after storageInit");
 
 #if ENABLE_GPS
   SerialGPS.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
@@ -2470,6 +3230,9 @@ void setup() {
   sessionStartMs = millis();
   lastLifetimeSaveAt = millis();
   lastActivityBucketAt = millis();
+#if USE_RGB_LED
+  rgbLastHeartbeatAt = millis();
+#endif
 }
 
 void loop() {

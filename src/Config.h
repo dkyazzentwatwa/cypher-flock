@@ -3,9 +3,10 @@
 #define ESP32_DEVKIT 1
 #define ESP32_S3     2
 #define ESP32_CYPHERBOX 3
+#define ESP32_WAVESHARE_AMOLED_18 4
 
 #ifndef BOARD_PROFILE
-#error "BOARD_PROFILE must be set. Use -DBOARD_PROFILE=ESP32_DEVKIT, -DBOARD_PROFILE=ESP32_S3, or -DBOARD_PROFILE=ESP32_CYPHERBOX"
+#error "BOARD_PROFILE must be set. Use -DBOARD_PROFILE=ESP32_DEVKIT, -DBOARD_PROFILE=ESP32_S3, -DBOARD_PROFILE=ESP32_CYPHERBOX, or -DBOARD_PROFILE=ESP32_WAVESHARE_AMOLED_18"
 #endif
 
 #if BOARD_PROFILE == ESP32_DEVKIT
@@ -14,8 +15,30 @@
 #include "profiles/ESP32_S3.h"
 #elif BOARD_PROFILE == ESP32_CYPHERBOX
 #include "profiles/Cypherbox.h"
+#elif BOARD_PROFILE == ESP32_WAVESHARE_AMOLED_18
+#include "profiles/Waveshare_AMOLED_18.h"
 #else
 #error "Unknown BOARD_PROFILE"
+#endif
+
+#ifndef USE_RGB_LED
+#define USE_RGB_LED 0
+#endif
+
+#ifndef USE_AMOLED_DISPLAY
+#define USE_AMOLED_DISPLAY 0
+#endif
+
+#ifndef USE_TOUCH_INPUT
+#define USE_TOUCH_INPUT 0
+#endif
+
+#ifndef ENABLE_POWER_STATUS
+#define ENABLE_POWER_STATUS 0
+#endif
+
+#ifndef USE_SD_MMC
+#define USE_SD_MMC 0
 #endif
 
 #define CHANNEL_MODE_FULL_HOP   0
