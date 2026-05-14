@@ -19,6 +19,7 @@ This repo is now maintained as **Cypher Flock**.
 - Saves detections locally in SPIFFS
 - Emits one JSON line per hit over USB serial
 - Shows live status on the SSD1306 display
+- Supports M5Stack Cardputer ADV display/keyboard controls
 - Supports a color/touch Waveshare AMOLED profile with battery status
 - Uses three buttons for navigation and control
 - Scans BLE advertisements for Flock/Raven signatures with confidence scoring
@@ -36,6 +37,7 @@ The v2 firmware is a single compile-time-profiled Arduino sketch:
 | `ESP32_DEVKIT` | ESP32 DevKit | Uses the normal ESP32 DevKit wiring, no button pullups on GPIO 34/36/39 |
 | `ESP32_CYPHERBOX` | Cypherbox board | Uses the Cypherbox display, buttons, SD, GPS, and RFID pin map |
 | `ESP32_WAVESHARE_AMOLED_18` | Waveshare ESP32-S3-Touch-AMOLED-1.8 | Uses SH8601 AMOLED, FT3168 touch, AXP2101 battery status, and 1-bit SD_MMC logging |
+| `ESP32_CARDPUTER_ADV` | M5Stack Cardputer ADV | Uses the built-in ST7789 display, TCA8418 keyboard, and BtnA with no external wiring |
 
 ## Hardware
 
@@ -97,6 +99,12 @@ The Waveshare AMOLED profile uses [src/profiles/Waveshare_AMOLED_18.h](src/profi
 | SD_MMC CMD | GPIO 1 |
 | SD_MMC D0 | GPIO 3 |
 
+### M5Stack Cardputer ADV
+
+The Cardputer profile uses [src/profiles/Cardputer_ADV.h](src/profiles/Cardputer_ADV.h).
+It uses the built-in screen and keyboard through `M5Cardputer`, so no external
+display or buttons are required.
+
 ## Button Behavior
 
 - `Up` changes pages or increases the current menu value
@@ -113,6 +121,11 @@ The firmware has 7 screens: scanner status, stats, last capture, live feed, GPS/
 The Waveshare AMOLED profile renders the same detector screens on the 368x448 SH8601 display. Swipe left/right changes pages, swipe up/down scrolls or edits menu values where relevant, bottom taps jump to common pages, and touch hold toggles stealth mode. Its header shows AXP2101 battery/USB status when available.
 
 On the Waveshare AMOLED profile, a short BOOT click cycles channel hopping mode (`FULL_HOP`, `CUSTOM`, `SINGLE`) and a long BOOT press toggles stealth mode. The `storage` serial command reports SD_MMC mount state, card type, size, and the last mount/write error when a card is not available.
+
+The Cardputer ADV profile renders the same 7 screens on the built-in ST7789
+display. Use `,` or `;` / `W` / `K` for previous, `.` or `/` / `S` / `J` for
+next, `Enter` or BtnA for the menu, `C` or `M` to cycle channel mode, and
+backtick / `Q` / `Del` / `Tab` to toggle stealth mode.
 
 ## Build
 
@@ -171,6 +184,14 @@ time.sleep(0.2)
 ser.close()
 PY
 arduino-cli upload -p "$PORT" --fqbn "$FQBN" --input-dir "$BUILD_DIR" .
+```
+
+For the M5Stack Cardputer ADV:
+
+```bash
+FQBN='m5stack:esp32:m5stack_cardputer:FlashSize=8M,PartitionScheme=default_8MB,CDCOnBoot=cdc,USBMode=hwcdc'
+arduino-cli compile --fqbn "$FQBN" \
+  --build-property "build.extra_flags=-DESP32 -DBOARD_PROFILE=ESP32_CARDPUTER_ADV" .
 ```
 
 Waveshare's examples are designed for ESP32 Arduino core 3.x. Use the 16 MB flash, OPI PSRAM, USB-OTG/TinyUSB, CDC-on-boot, and local custom partition settings shown above. `arduino-cli upload` does not accept `--build-property`, so compile with the profile flag first and upload from the generated build directory.

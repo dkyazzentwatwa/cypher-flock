@@ -11,6 +11,18 @@
 #include <stdarg.h>
 #include <string>
 #include "Config.h"
+#if USE_CARDPUTER_DISPLAY
+#include <CypherPuterReturn.h>
+#endif
+
+static void fyReturnToLauncher(uint32_t delayMs) {
+#if USE_CARDPUTER_DISPLAY
+  cypherPuterReturnToLauncher(delayMs);
+#else
+  delay(delayMs);
+  ESP.restart();
+#endif
+}
 
 #ifndef USB_SERIAL_WAIT_MS
 #define USB_SERIAL_WAIT_MS 3000
@@ -29,6 +41,9 @@
 #endif
 #include <Wire.h>
 #include <Adafruit_GFX.h>
+#if USE_CARDPUTER_DISPLAY
+#include <M5Cardputer.h>
+#endif
 #if USE_AMOLED_DISPLAY
 #include <Adafruit_XCA9554.h>
 #include <Arduino_GFX_Library.h>
@@ -39,7 +54,7 @@
 #define XPOWERS_CHIP_AXP2101
 #include <XPowersLib.h>
 #endif
-#if !USE_AMOLED_DISPLAY
+#if !USE_AMOLED_DISPLAY && !USE_CARDPUTER_DISPLAY
 #include <Adafruit_SSD1306.h>
 #include <U8g2_for_Adafruit_GFX.h>
 #endif
@@ -316,9 +331,22 @@ static unsigned long uiLastRefreshAt = 0;
 static uint8_t uiPage = 0;
 static bool uiMenuMode = false;
 static uint8_t uiMenuIndex = 0;
-static const uint8_t uiMenuItems = 2;
+static const uint8_t uiMenuItems = 3;
 static unsigned long uiStatusUntilMs = 0;
 static char uiStatusLine[32] = "";
+
+static const char* uiMenuLabel() {
+  if (uiMenuIndex == 0) return "channel mode";
+  if (uiMenuIndex == 1) return "buzzer";
+  return "launcher";
+}
+
+static const char* uiMenuShortLabel() {
+  if (uiMenuIndex == 0) return "CH";
+  if (uiMenuIndex == 1) return "BUZZ";
+  return "HOME";
+}
+
 #if USE_AMOLED_DISPLAY
 static bool amoledNeedsFullRedraw = true;
 static uint8_t amoledLastPage = 255;
@@ -339,6 +367,8 @@ static int16_t touchDownX = -1;
 static int16_t touchDownY = -1;
 static int16_t touchLastX = -1;
 static int16_t touchLastY = -1;
+#elif USE_CARDPUTER_DISPLAY
+static bool cardputerUiDirty = true;
 #else
 static Adafruit_SSD1306 display(OLED_W, OLED_H, &Wire, OLED_RESET);
 static U8G2_FOR_ADAFRUIT_GFX uiFonts;
@@ -2003,6 +2033,76 @@ static void uiFitText(char* out, size_t outLen, const char* in, uint8_t maxChars
   out[maxChars] = '\0';
 }
 
+#if USE_CARDPUTER_DISPLAY
+static const uint16_t CARD_BLACK = 0x0000;
+static const uint16_t CARD_WHITE = 0xFFFF;
+static const uint16_t CARD_DIM = 0x9CD3;
+static const uint16_t CARD_PANEL = 0x0841;
+static const uint16_t CARD_ACCENT = 0x07FF;
+static const uint16_t CARD_WARN = 0xFD20;
+static const uint16_t CARD_DANGER = 0xF800;
+static const uint16_t CARD_OK = 0x07E0;
+
+static void cardText(int16_t x, int16_t y, const char* text, uint8_t size = 1,
+                     uint16_t color = CARD_WHITE, uint16_t bg = CARD_BLACK) {
+  M5Cardputer.Display.setTextSize(size);
+  M5Cardputer.Display.setTextColor(color, bg);
+  M5Cardputer.Display.setCursor(x, y);
+  M5Cardputer.Display.print(text);
+}
+
+static void cardPrintf(int16_t x, int16_t y, uint8_t size, uint16_t color, const char* fmt, ...) {
+  char buf[80];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, args);
+  va_end(args);
+  cardText(x, y, buf, size, color);
+}
+
+static void cardHeader(const char* title) {
+  M5Cardputer.Display.fillRect(0, 0, M5Cardputer.Display.width(), 21, CARD_BLACK);
+  M5Cardputer.Display.drawFastHLine(0, 20, M5Cardputer.Display.width(), CARD_PANEL);
+  cardText(6, 5, title, 1, CARD_ACCENT);
+  cardPrintf(208, 5, 1, CARD_DIM, "%u/7", (unsigned)(uiPage + 1));
+}
+
+static void cardFooter(unsigned long now) {
+  int16_t y = M5Cardputer.Display.height() - 17;
+  M5Cardputer.Display.fillRect(0, y, M5Cardputer.Display.width(), 17, CARD_BLACK);
+  M5Cardputer.Display.drawFastHLine(0, y, M5Cardputer.Display.width(), CARD_PANEL);
+  char line[42];
+  if (uiMenuMode) {
+    snprintf(line, sizeof(line), "MENU %s  arrows edit  Enter next", uiMenuShortLabel());
+  } else if (uiStatusUntilMs > now) {
+    uiFitText(line, sizeof(line), uiStatusLine, 38);
+  } else {
+    snprintf(line, sizeof(line), "%s Ch%u %s", sniffingPaused ? "PAUSED" : "SCAN", currentChannel, channelModeName());
+  }
+  cardText(6, y + 5, line, 1, CARD_DIM);
+}
+
+static void cardPill(int16_t x, int16_t y, const char* label, bool active) {
+  int16_t w = (int16_t)(strlen(label) * 6 + 11);
+  uint16_t color = active ? CARD_ACCENT : CARD_DIM;
+  M5Cardputer.Display.drawRoundRect(x, y, w, 15, 3, color);
+  if (active) M5Cardputer.Display.fillRoundRect(x + 2, y + 2, w - 4, 11, 2, CARD_PANEL);
+  cardText(x + 5, y + 4, label, 1, color);
+}
+
+static void cardBar(int16_t x, int16_t y, int16_t w, int16_t h, uint8_t pct, uint16_t color) {
+  pct = constrain(pct, 0, 100);
+  M5Cardputer.Display.drawRoundRect(x, y, w, h, 3, CARD_DIM);
+  int16_t fill = (int16_t)((w - 4) * pct / 100);
+  if (fill > 0) M5Cardputer.Display.fillRoundRect(x + 2, y + 2, fill, h - 4, 2, color);
+}
+
+static void cardMetric(int16_t x, int16_t y, const char* label, unsigned long value, uint16_t color) {
+  cardText(x, y, label, 1, CARD_DIM);
+  cardPrintf(x, y + 13, 2, color, "%lu", value);
+}
+#endif
+
 #if USE_AMOLED_DISPLAY
 static const uint16_t AMOLED_BLACK = 0x0000;
 static const uint16_t AMOLED_WHITE = 0xFFFF;
@@ -2087,7 +2187,7 @@ static void amoledFooter(unsigned long now) {
   amoled->drawFastHLine(14, AMOLED_H - 48, AMOLED_W - 28, AMOLED_DIM);
   char line[44];
   if (uiMenuMode) {
-    snprintf(line, sizeof(line), "MENU %s  swipe edits", (uiMenuIndex == 0) ? "CH" : "BUZZ");
+    snprintf(line, sizeof(line), "MENU %s  swipe edits", uiMenuShortLabel());
   } else if (uiStatusUntilMs > now) {
     uiFitText(line, sizeof(line), uiStatusLine, 40);
   } else {
@@ -2210,6 +2310,24 @@ static void displayInit() {
   powerLabel(pwr, sizeof(pwr));
   amoledPrintf(55, 282, 2, AMOLED_OK, "touch %s  power %s", uiTouchReady ? "ok" : "off", pwr);
   delay(5000);
+#elif USE_CARDPUTER_DISPLAY
+  dualPrintln("[cypher-flock] Cardputer displayInit begin");
+  auto cfg = M5.config();
+  M5Cardputer.begin(cfg, true);
+  M5Cardputer.Display.setRotation(1);
+  M5Cardputer.Display.setTextWrap(false);
+  M5Cardputer.Display.setBrightness(CARDPUTER_BRIGHTNESS);
+  M5Cardputer.Display.fillScreen(CARD_BLACK);
+  uiDisplayReady = true;
+  cardputerUiDirty = true;
+
+  M5Cardputer.Display.drawRoundRect(8, 10, M5Cardputer.Display.width() - 16,
+                                    M5Cardputer.Display.height() - 20, 7, CARD_ACCENT);
+  cardText(22, 31, "CYPHER", 2, CARD_WHITE);
+  cardText(22, 58, "FLOCK", 2, CARD_ACCENT);
+  cardText(22, 92, "passive detector", 1, CARD_DIM);
+  cardText(136, 92, "Cardputer ADV", 1, CARD_OK);
+  delay(2500);
 #else
   Wire.begin(OLED_SDA_PIN, OLED_SCL_PIN);
   Wire.setClock(100000);
@@ -2315,6 +2433,8 @@ static void cycleChannelModeFromButton() {
   uiStatusUntilMs = millis() + 1400;
 #if USE_AMOLED_DISPLAY
   amoledNeedsFullRedraw = true;
+#elif USE_CARDPUTER_DISPLAY
+  cardputerUiDirty = true;
 #endif
 }
 
@@ -2406,6 +2526,8 @@ static void applyUiChange(int delta) {
     uiPage = (uint8_t)((uiPage + (delta > 0 ? 1 : 6)) % 7);
 #if USE_AMOLED_DISPLAY
     amoledNeedsFullRedraw = true;
+#elif USE_CARDPUTER_DISPLAY
+    cardputerUiDirty = true;
 #endif
     return;
   }
@@ -2419,11 +2541,25 @@ static void applyUiChange(int delta) {
     uiStatusUntilMs = millis() + 1200;
 #if USE_AMOLED_DISPLAY
     amoledNeedsFullRedraw = true;
+#elif USE_CARDPUTER_DISPLAY
+    cardputerUiDirty = true;
 #endif
-  } else {
+  } else if (uiMenuIndex == 1) {
     uiBuzzerMuted = (delta > 0) ? true : false;
     strlcpy(uiStatusLine, uiBuzzerMuted ? "buzzer muted" : "buzzer unmuted", sizeof(uiStatusLine));
     uiStatusUntilMs = millis() + 1200;
+#if USE_CARDPUTER_DISPLAY
+    cardputerUiDirty = true;
+#endif
+  } else {
+    strlcpy(uiStatusLine, "returning launcher", sizeof(uiStatusLine));
+    uiStatusUntilMs = millis() + 800;
+#if USE_AMOLED_DISPLAY
+    amoledNeedsFullRedraw = true;
+#elif USE_CARDPUTER_DISPLAY
+    cardputerUiDirty = true;
+#endif
+    fyReturnToLauncher(650);
   }
 }
 
@@ -2464,6 +2600,9 @@ static void onLongPress(ButtonState* b) {
 #if USE_AMOLED_DISPLAY
     amoledNeedsFullRedraw = true;
     if (stealthMode && uiDisplayReady && amoled) amoled->fillScreen(AMOLED_BLACK);
+#elif USE_CARDPUTER_DISPLAY
+    cardputerUiDirty = true;
+    if (stealthMode && uiDisplayReady) M5Cardputer.Display.fillScreen(CARD_BLACK);
 #else
     if (stealthMode && uiDisplayReady) {
       display.clearDisplay();
@@ -2493,7 +2632,68 @@ static void pollButton(ButtonState* b) {
   }
 }
 
+#if USE_CARDPUTER_DISPLAY
+static void cardputerSelectShort() {
+  if (!uiMenuMode) {
+    uiMenuMode = true;
+    uiMenuIndex = 0;
+    strlcpy(uiStatusLine, "menu opened", sizeof(uiStatusLine));
+  } else {
+    uiMenuIndex++;
+    if (uiMenuIndex >= uiMenuItems) {
+      uiMenuMode = false;
+      uiMenuIndex = 0;
+      strlcpy(uiStatusLine, "menu closed", sizeof(uiStatusLine));
+    } else {
+      strlcpy(uiStatusLine, "next menu item", sizeof(uiStatusLine));
+    }
+  }
+  uiStatusUntilMs = millis() + 1200;
+  cardputerUiDirty = true;
+}
+
+static void cardputerToggleStealth() {
+  stealthMode = !stealthMode;
+  uiBuzzerMuted = stealthMode;
+  strlcpy(uiStatusLine, stealthMode ? "stealth on" : "stealth off", sizeof(uiStatusLine));
+  uiStatusUntilMs = millis() + 1200;
+  cardputerUiDirty = true;
+  if (stealthMode && uiDisplayReady) M5Cardputer.Display.fillScreen(CARD_BLACK);
+}
+
+static void cardputerPollKeyboard() {
+  M5Cardputer.update();
+  bool prev = false;
+  bool next = false;
+  bool select = M5Cardputer.BtnA.wasClicked();
+  bool cycle = false;
+  bool stealth = false;
+
+  if (M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()) {
+    Keyboard_Class::KeysState keys = M5Cardputer.Keyboard.keysState();
+    select = select || keys.enter;
+    stealth = stealth || keys.del || keys.tab;
+    for (auto c : keys.word) {
+      if (c == ',' || c == ';' || c == 'w' || c == 'W' || c == 'k' || c == 'K') prev = true;
+      if (c == '.' || c == '/' || c == 's' || c == 'S' || c == 'j' || c == 'J') next = true;
+      if (c == 'c' || c == 'C' || c == 'm' || c == 'M') cycle = true;
+      if (c == '`' || c == 'q' || c == 'Q') stealth = true;
+    }
+  }
+
+  if (prev) applyUiChange(-1);
+  if (next) applyUiChange(1);
+  if (cycle) cycleChannelModeFromButton();
+  if (select) cardputerSelectShort();
+  if (stealth) cardputerToggleStealth();
+}
+#endif
+
 static void buttonsPoll() {
+#if USE_CARDPUTER_DISPLAY
+  cardputerPollKeyboard();
+  return;
+#endif
 #if BTN_UP_PIN >= 0
   pollButton(&btnUp);
 #endif
@@ -2606,9 +2806,101 @@ static void displayRender() {
 
   if (uiMenuMode) {
     amoled->drawRoundRect(18, 336, 332, 48, 8, AMOLED_WARN);
-    amoledPrintf(32, 352, 2, AMOLED_WARN, "Menu: %s", uiMenuIndex == 0 ? "channel mode" : "buzzer");
+    amoledPrintf(32, 352, 2, AMOLED_WARN, "Menu: %s", uiMenuLabel());
   }
   amoledFooter(now);
+}
+#elif USE_CARDPUTER_DISPLAY
+static void displayRender() {
+  if (!uiDisplayReady || stealthMode) return;
+  unsigned long now = millis();
+  if (!cardputerUiDirty && now - uiLastRefreshAt < CARDPUTER_REFRESH_MS) return;
+  uiLastRefreshAt = now;
+  cardputerUiDirty = false;
+
+  M5Cardputer.Display.fillScreen(CARD_BLACK);
+  int16_t h = M5Cardputer.Display.height();
+
+  if (uiPage == 0) {
+    cardHeader("DASHBOARD");
+    cardMetric(8, 30, "WiFi", (unsigned long)sessionWifi, CARD_ACCENT);
+    cardMetric(83, 30, "BLE", (unsigned long)sessionBle, CARD_OK);
+    cardMetric(156, 30, "Raven", (unsigned long)sessionRaven, CARD_WARN);
+    cardPill(8, 77, "AP", apReady);
+    cardPill(44, 77, "SD", sdReady);
+#if ENABLE_GPS
+    cardPill(80, 77, "GPS", gps.location.isValid());
+#else
+    cardPill(80, 77, "GPS", false);
+#endif
+    cardPrintf(128, 80, 1, CARD_DIM, "Q:%lu  Heap:%lu",
+               (unsigned long)alertQueueDrops, (unsigned long)(ESP.getFreeHeap() / 1024));
+  } else if (uiPage == 1) {
+    cardHeader("STATS");
+    cardText(8, 30, "Type        Session      Total", 1, CARD_DIM);
+    cardPrintf(8, 48, 1, CARD_WHITE, "WiFi        %6lu   %8lu", (unsigned long)sessionWifi, (unsigned long)(lifetimeWifi + sessionWifi));
+    cardPrintf(8, 66, 1, CARD_WHITE, "BLE         %6lu   %8lu", (unsigned long)sessionBle, (unsigned long)(lifetimeBle + sessionBle));
+    cardPrintf(8, 84, 1, CARD_WHITE, "Raven       %6lu   %8lu", (unsigned long)sessionRaven, (unsigned long)(lifetimeRaven + sessionRaven));
+  } else if (uiPage == 2) {
+    char method[28];
+    uiFitText(method, sizeof(method), uiLastMethod[0] ? uiLastMethod : "waiting for detection", 26);
+    cardHeader("LAST HIT");
+    cardText(8, 30, method, 1, CARD_ACCENT);
+    cardText(8, 49, uiLastMac[0] ? uiLastMac : "--:--:--:--:--:--", 2, CARD_WHITE);
+    cardPrintf(8, 78, 1, CARD_DIM, "%s  %u%%  %ddBm  Ch%u",
+               uiLastConfidenceLabel, (unsigned)uiLastConfidence, uiLastRssi, (unsigned)uiLastChannel);
+    cardBar(8, 95, 150, 12, uiLastConfidence, CARD_ACCENT);
+  } else if (uiPage == 3) {
+    cardHeader("LIVE FEED");
+    for (uint8_t i = 0; i < 5; i++) {
+      char row[36];
+      uiFitText(row, sizeof(row), uiLiveFeed[i][0] ? uiLiveFeed[i] : "waiting...", 34);
+      cardPrintf(8, 29 + i * 17, 1, i == 0 ? CARD_WHITE : CARD_DIM, "%u  %s", (unsigned)(i + 1), row);
+    }
+  } else if (uiPage == 4) {
+    cardHeader("STORAGE");
+#if ENABLE_GPS
+    if (gps.location.isValid()) {
+      cardPrintf(8, 32, 1, CARD_WHITE, "Lat %.5f", gps.location.lat());
+      cardPrintf(8, 49, 1, CARD_WHITE, "Lon %.5f", gps.location.lng());
+    } else {
+      cardText(8, 32, "GPS waiting for NMEA", 1, CARD_DIM);
+    }
+#else
+    cardText(8, 32, "GPS not compiled", 1, CARD_DIM);
+#endif
+#if ENABLE_SD_LOGGING
+    cardPrintf(8, 58, 1, sdReady ? CARD_OK : CARD_WARN, "SD: %s", sdReady ? currentLogFile.c_str() : sdStatusLine);
+#else
+    cardText(8, 58, "SD logging not compiled", 1, CARD_DIM);
+#endif
+    cardPrintf(8, 80, 1, fySpiffsReady ? CARD_OK : CARD_WARN, "LittleFS: %s", fySpiffsReady ? "ready" : "off");
+  } else if (uiPage == 5) {
+    cardHeader("ACTIVITY");
+    M5Cardputer.Display.drawRoundRect(8, 32, 222, 67, 5, CARD_DIM);
+    for (uint8_t i = 0; i < 25; i++) {
+      uint8_t idx = (activityBucketIndex + i + 1) % 25;
+      uint32_t rawH = activityBuckets[idx] * 6;
+      uint8_t barH = rawH > 58 ? 58 : (uint8_t)rawH;
+      int16_t x = 14 + i * 8;
+      M5Cardputer.Display.fillRect(x, 95 - barH, 5, barH, CARD_ACCENT);
+    }
+    cardText(10, 104, "last 25 seconds", 1, CARD_DIM);
+  } else {
+    int rssiPct = map(constrain(uiLastRssi, -95, -35), -95, -35, 0, 100);
+    cardHeader("PROXIMITY");
+    cardPrintf(8, 36, 2, CARD_WHITE, "%d dBm", uiLastRssi);
+    cardBar(8, 68, 214, 16, (uint8_t)rssiPct, rssiPct > 65 ? CARD_DANGER : CARD_ACCENT);
+    cardPrintf(8, 94, 1, CARD_DIM, "%s %u%%  Stealth %s",
+               uiLastConfidenceLabel, (unsigned)uiLastConfidence, stealthMode ? "ON" : "OFF");
+  }
+
+  if (uiMenuMode) {
+    int16_t y = h - 38;
+    M5Cardputer.Display.drawRoundRect(126, y, 106, 18, 3, CARD_WARN);
+    cardPrintf(133, y + 5, 1, CARD_WARN, "%s", uiMenuLabel());
+  }
+  cardFooter(now);
 }
 #else
 static void uiSetFontSmall(uint16_t color = SSD1306_WHITE) {
@@ -2653,7 +2945,7 @@ static void uiFooter(unsigned long now) {
   display.drawFastHLine(0, 55, OLED_W, SSD1306_WHITE);
   char line[28];
   if (uiMenuMode) {
-    snprintf(line, sizeof(line), "MENU %s  UP/DN edit", (uiMenuIndex == 0) ? "CH" : "BUZZ");
+    snprintf(line, sizeof(line), "MENU %s  UP/DN edit", uiMenuShortLabel());
   } else if (uiStatusUntilMs > now) {
     uiFitText(line, sizeof(line), uiStatusLine, 24);
   } else {
@@ -2834,7 +3126,7 @@ static void serialPrintHelp() {
   cmdPrintf("commands: help, status, page [next|prev|0-6], menu");
   cmdPrintf("scan: mode full|custom|single, channel 1-13, scan pause|resume");
   cmdPrintf("controls: buzzer on|off, stealth on|off, gps, storage, detections");
-  cmdPrintf("session: reset session, save, reboot");
+  cmdPrintf("session: reset session, save, launcher, reboot");
 }
 
 static void serialPrintStatus() {
@@ -2968,6 +3260,9 @@ static void serialSetStealth(const char* arg) {
     uiBuzzerMuted = true;
 #if USE_AMOLED_DISPLAY
     if (uiDisplayReady && amoled) amoled->fillScreen(AMOLED_BLACK);
+#elif USE_CARDPUTER_DISPLAY
+    cardputerUiDirty = true;
+    if (uiDisplayReady) M5Cardputer.Display.fillScreen(CARD_BLACK);
 #else
     if (uiDisplayReady) {
       display.clearDisplay();
@@ -2976,6 +3271,9 @@ static void serialSetStealth(const char* arg) {
 #endif
   } else if (argEquals(arg, "off")) {
     stealthMode = false;
+    #if USE_CARDPUTER_DISPLAY
+    cardputerUiDirty = true;
+    #endif
   } else {
     cmdPrintf("usage: stealth on|off");
     return;
@@ -3089,6 +3387,9 @@ static void serialExecuteCommand(char* raw) {
       fySaveSession();
       cmdPrintf("save requested");
     }
+  } else if (argEquals(argv[0], "launcher") || argEquals(argv[0], "return")) {
+    cmdPrintf("returning to launcher");
+    fyReturnToLauncher(250);
   } else if (argEquals(argv[0], "reboot")) {
     cmdPrintf("rebooting");
     delay(100);
