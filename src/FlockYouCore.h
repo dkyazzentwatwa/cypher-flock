@@ -144,6 +144,38 @@ static volatile size_t alertTail = 0;  // read by loop()
 static portMUX_TYPE    queueMux  = portMUX_INITIALIZER_UNLOCKED;
 static volatile uint32_t alertQueueDrops = 0;
 
+#define DIAG_NEAR_FRAME_SLOTS 5
+#define DIAG_SRC_WIFI_MGMT 0
+#define DIAG_SRC_WIFI_DATA 1
+#define DIAG_SRC_BLE       2
+#define DIAG_FLAG_TARGET   0x01
+#define DIAG_FLAG_LOCAL    0x02
+#define DIAG_FLAG_ADDR1    0x04
+#define DIAG_FLAG_ADDR2    0x08
+#define DIAG_FLAG_ADDR3    0x10
+
+typedef struct {
+  uint32_t seq;
+  uint8_t  source;
+  uint8_t  subtype;
+  uint8_t  flags;
+  uint8_t  mac[6];
+  int8_t   rssi;
+  uint8_t  channel;
+} DiagNearFrame;
+
+static volatile uint32_t diagMgmtFrames = 0;
+static volatile uint32_t diagDataFrames = 0;
+static volatile uint32_t diagBleReports = 0;
+static volatile uint32_t diagStrongFrames = 0;
+static volatile uint32_t diagLocalAdminTargetHits = 0;
+static volatile uint32_t diagNearSeq = 0;
+static volatile uint8_t diagNearHead = 0;
+static volatile DiagNearFrame diagNearFrames[DIAG_NEAR_FRAME_SLOTS];
+static portMUX_TYPE diagMux = portMUX_INITIALIZER_UNLOCKED;
+static bool diagPeriodicEnabled = false;
+static unsigned long diagLastPrintAt = 0;
+
 static void IRAM_ATTR enqueueAlert(AlertType type, const uint8_t* mac, int8_t rssi,
                                     uint8_t ch, const char* ssid, const char* kind) {
   portENTER_CRITICAL_ISR(&queueMux);
@@ -616,16 +648,42 @@ static inline bool IRAM_ATTR isMulticast(const uint8_t* mac) {
 }
 
 static bool IRAM_ATTR matchOuiRaw(const uint8_t* mac) {
-  // Locally-administered (randomised) MACs have bit 1 of byte 0 set.
-  // Fixed infrastructure devices never use them — skip immediately.
-  if (mac[0] & 0x02) return false;
-
+  // Match the explicit field list only. Do not reject locally-administered
+  // target prefixes here: 82:6b:f2 is a field-proven DeFlockJoplin prefix
+  // and has the local bit set.
+  if (isMulticast(mac)) return false;
   for (size_t i = 0; i < OUI_COUNT; i++) {
     if (mac[0] == oui_bytes[i][0] &&
         mac[1] == oui_bytes[i][1] &&
         mac[2] == oui_bytes[i][2]) return true;
   }
   return false;
+}
+
+static bool IRAM_ATTR isLocalAdminMac(const uint8_t* mac) {
+  return mac[0] & 0x02;
+}
+
+static bool IRAM_ATTR isDeflockWildcardOui(const uint8_t* mac) {
+  return mac[0] == 0x82 && mac[1] == 0x6b && mac[2] == 0xf2;
+}
+
+static void IRAM_ATTR diagRecordNearFrame(uint8_t source, const uint8_t* mac,
+                                          int8_t rssi, uint8_t channel,
+                                          uint8_t subtype, uint8_t flags) {
+  if (rssi < DIAG_NEAR_RSSI_MIN || !mac) return;
+  portENTER_CRITICAL_ISR(&diagMux);
+  DiagNearFrame* f = (DiagNearFrame*)&diagNearFrames[diagNearHead];
+  f->seq = ++diagNearSeq;
+  f->source = source;
+  f->subtype = subtype;
+  f->flags = flags;
+  memcpy((void*)f->mac, mac, 6);
+  f->rssi = rssi;
+  f->channel = channel;
+  diagNearHead = (uint8_t)((diagNearHead + 1) % DIAG_NEAR_FRAME_SLOTS);
+  diagStrongFrames++;
+  portEXIT_CRITICAL_ISR(&diagMux);
 }
 
 static char* strcasestr_local(const char* haystack, const char* needle) {
@@ -1375,7 +1433,7 @@ static void emitDetectionJSON(const char* mac, const char* method, const char* p
   dualPrintf(
       "{\"event\":\"detection\","
       "\"detection_method\":\"%s\","
-      "\"protocol\":\"wifi_2_4ghz\","
+      "\"protocol\":\"%s\","
       "\"mac_address\":\"%s\","
       "\"oui\":\"%s\","
       "\"device_name\":\"%s\","
@@ -1446,10 +1504,37 @@ static void IRAM_ATTR wifiSniffer(void* buf, wifi_promiscuous_pkt_type_t type) {
   if (pkt->rx_ctrl.sig_len < sizeof(wifi_ieee80211_mac_hdr_t)) return;
   wifi_ieee80211_mac_hdr_t*    hdr = (wifi_ieee80211_mac_hdr_t*)pkt->payload;
   int8_t rssi = pkt->rx_ctrl.rssi;
+  uint8_t fc0     = hdr->frame_ctrl & 0xFF;
+  uint8_t ftype   = (fc0 >> 2) & 0x03;
+  uint8_t subtype = (fc0 >> 4) & 0x0F;
+
+  if (type == WIFI_PKT_MGMT) diagMgmtFrames++;
+  else if (type == WIFI_PKT_DATA) diagDataFrames++;
 
   if (rssi < RSSI_MIN) return;
 
   uint8_t ch = (uint8_t)pkt->rx_ctrl.channel;  // actual rx channel from driver
+  const bool addr2Match = matchOuiRaw(hdr->addr2);
+  const bool addr1Match = !isMulticast(hdr->addr1) && matchOuiRaw(hdr->addr1);
+  const bool addr3Match = (type == WIFI_PKT_MGMT) && matchOuiRaw(hdr->addr3);
+
+  if (addr2Match && isLocalAdminMac(hdr->addr2)) diagLocalAdminTargetHits++;
+  if (addr1Match && isLocalAdminMac(hdr->addr1)) diagLocalAdminTargetHits++;
+  if (addr3Match && isLocalAdminMac(hdr->addr3)) diagLocalAdminTargetHits++;
+
+  uint8_t diagFlags = isLocalAdminMac(hdr->addr2) ? DIAG_FLAG_LOCAL : 0;
+  const uint8_t* diagMac = hdr->addr2;
+  if (addr2Match) {
+    diagFlags |= DIAG_FLAG_TARGET | DIAG_FLAG_ADDR2;
+  } else if (addr1Match) {
+    diagMac = hdr->addr1;
+    diagFlags = DIAG_FLAG_TARGET | DIAG_FLAG_ADDR1 | (isLocalAdminMac(hdr->addr1) ? DIAG_FLAG_LOCAL : 0);
+  } else if (addr3Match) {
+    diagMac = hdr->addr3;
+    diagFlags = DIAG_FLAG_TARGET | DIAG_FLAG_ADDR3 | (isLocalAdminMac(hdr->addr3) ? DIAG_FLAG_LOCAL : 0);
+  }
+  diagRecordNearFrame(type == WIFI_PKT_MGMT ? DIAG_SRC_WIFI_MGMT : DIAG_SRC_WIFI_DATA,
+                      diagMac, rssi, ch, subtype, diagFlags);
 
   // --- OUI check: addr2 (transmitter/source) ---
   //
@@ -1460,12 +1545,9 @@ static void IRAM_ATTR wifiSniffer(void* buf, wifi_promiscuous_pkt_type_t type) {
   //
   // Non-probe frames from the same OUI still emit the broad ADDR2 alert.
   // See: https://github.com/DeflockJoplin/flock-you
-  if (matchOuiRaw(hdr->addr2)) {
+  if (addr2Match) {
     bool emitted = false;
     if (type == WIFI_PKT_MGMT) {
-      uint8_t fc0     = hdr->frame_ctrl & 0xFF;
-      uint8_t ftype   = (fc0 >> 2) & 0x03;
-      uint8_t subtype = (fc0 >> 4) & 0x0F;
       if (ftype == 0 && subtype == 4) {                        // Probe Request
         int sigLen  = (int)pkt->rx_ctrl.sig_len;
         int bodyLen = sigLen - (int)sizeof(wifi_ieee80211_mac_hdr_t);
@@ -1492,7 +1574,7 @@ static void IRAM_ATTR wifiSniffer(void* buf, wifi_promiscuous_pkt_type_t type) {
   // dst of probe responses and data frames — never transmitting in the capture
   // window due to their burst-sleep duty cycle. Multicast guard is mandatory
   // here since addr1 is broadcast (ff:ff:ff:ff:ff:ff) in beacons/broadcasts.
-  if (!isMulticast(hdr->addr1) && matchOuiRaw(hdr->addr1)) {
+  if (addr1Match) {
     enqueueAlert(ALERT_OUI_ADDR1, hdr->addr1, rssi, ch, nullptr, "addr1");
   }
 #endif
@@ -1500,17 +1582,13 @@ static void IRAM_ATTR wifiSniffer(void* buf, wifi_promiscuous_pkt_type_t type) {
 #if CHECK_ADDR3
   // addr3 fallback: catches cases where addr2 is randomised but addr3
   // carries the real BSSID OUI (management frames only).
-  if (type == WIFI_PKT_MGMT && matchOuiRaw(hdr->addr3)) {
+  if (addr3Match) {
     enqueueAlert(ALERT_OUI_ADDR3, hdr->addr3, rssi, ch, nullptr, "addr3");
   }
 #endif
 
 #if ENABLE_SSID_MATCH
   if (type == WIFI_PKT_MGMT) {
-    uint8_t fc0     = hdr->frame_ctrl & 0xFF;
-    uint8_t subtype = (fc0 >> 4) & 0x0F;
-    uint8_t ftype   = (fc0 >> 2) & 0x03;
-
     if (ftype == 0) {
       int sigLen = pkt->rx_ctrl.sig_len - 4;  // strip 4-byte FCS
       if (sigLen < (int)sizeof(wifi_ieee80211_mac_hdr_t)) return;
@@ -1647,6 +1725,7 @@ class FlockBleCallbacks : public NimBLEScanCallbacks {
     std::string addrText = addr.toString();
     uint8_t mac[6] = {0};
     if (!parseMacString(addrText.c_str(), mac)) return;
+    diagBleReports++;
 
     char name[33] = "";
     if (advertisedDevice->haveName()) {
@@ -1663,6 +1742,9 @@ class FlockBleCallbacks : public NimBLEScanCallbacks {
     bool penguinNum = isPenguinNumericName(name);
     int ravenCount = countRavenUuids(advertisedDevice);
     bool raven = ravenCount > 0;
+    uint8_t diagFlags = isLocalAdminMac(mac) ? DIAG_FLAG_LOCAL : 0;
+    if (macMatch || nameMatch || penguinNum || raven) diagFlags |= DIAG_FLAG_TARGET;
+    diagRecordNearFrame(DIAG_SRC_BLE, mac, advertisedDevice->getRSSI(), 0, 0, diagFlags);
 
     if (macMatch) { confidence += CONF_MAC_PREFIX; strlcat(methods, "ble_mac ", sizeof(methods)); methodCount++; }
     if (nameMatch) { confidence += CONF_BLE_NAME; strlcat(methods, "ble_name ", sizeof(methods)); methodCount++; }
@@ -1777,6 +1859,9 @@ static void drainAlertQueue() {
       rssiTrackUpdate(macStr, e.rssi);
       if (confidence >= CONFIDENCE_ALARM_THRESHOLD && rssiTrackStationaryBonus(macStr)) confidence += CONF_BONUS_STATIONARY;
       if (confidence > 100) confidence = 100;
+      if (e.type == ALERT_WILDCARD_PROBE && isDeflockWildcardOui(e.mac) && confidence < CONFIDENCE_HIGH) {
+        confidence = CONFIDENCE_HIGH;
+      }
     }
 
     const char* protocol = isBle ? "bluetooth_le" : "wifi_2_4ghz";
@@ -3125,7 +3210,7 @@ static bool argEquals(const char* a, const char* b) {
 static void serialPrintHelp() {
   cmdPrintf("commands: help, status, page [next|prev|0-6], menu");
   cmdPrintf("scan: mode full|custom|single, channel 1-13, scan pause|resume");
-  cmdPrintf("controls: buzzer on|off, stealth on|off, gps, storage, detections");
+  cmdPrintf("controls: buzzer on|off, stealth on|off, gps, storage, detections, diag [on|off]");
   cmdPrintf("session: reset session, save, launcher, reboot");
 }
 
@@ -3323,6 +3408,75 @@ static void serialPrintDetections() {
   }
 }
 
+static const char* diagSourceName(uint8_t source) {
+  switch (source) {
+    case DIAG_SRC_WIFI_MGMT: return "wifi_mgmt";
+    case DIAG_SRC_WIFI_DATA: return "wifi_data";
+    case DIAG_SRC_BLE:       return "ble";
+    default:                 return "unknown";
+  }
+}
+
+static void diagFormatFlags(uint8_t flags, char* buf, size_t len) {
+  if (!buf || len == 0) return;
+  buf[0] = '\0';
+  if (flags & DIAG_FLAG_TARGET) strlcat(buf, "target,", len);
+  if (flags & DIAG_FLAG_LOCAL) strlcat(buf, "local,", len);
+  if (flags & DIAG_FLAG_ADDR1) strlcat(buf, "addr1,", len);
+  if (flags & DIAG_FLAG_ADDR2) strlcat(buf, "addr2,", len);
+  if (flags & DIAG_FLAG_ADDR3) strlcat(buf, "addr3,", len);
+  size_t n = strlen(buf);
+  if (n > 0 && buf[n - 1] == ',') buf[n - 1] = '\0';
+  if (!buf[0]) strlcpy(buf, "-", len);
+}
+
+static void serialPrintDiag() {
+  DiagNearFrame nearFrames[DIAG_NEAR_FRAME_SLOTS];
+  uint8_t nearHead = 0;
+  portENTER_CRITICAL(&diagMux);
+  memcpy(nearFrames, (const void*)diagNearFrames, sizeof(nearFrames));
+  nearHead = diagNearHead;
+  portEXIT_CRITICAL(&diagMux);
+
+  const char* scanState = sniffingStopped ? "stopped" : (sniffingPaused ? "paused" : "running");
+  cmdPrintf("diag=%s scan=%s mode=%s channel=%u rssi_min=%d near_rssi_min=%d",
+            diagPeriodicEnabled ? "on" : "off", scanState, channelModeName(),
+            (unsigned)currentChannel, RSSI_MIN, DIAG_NEAR_RSSI_MIN);
+  cmdPrintf("frames mgmt=%lu data=%lu ble=%lu strong=%lu queue_drops=%lu local_admin_old_suppressed=%lu",
+            (unsigned long)diagMgmtFrames, (unsigned long)diagDataFrames,
+            (unsigned long)diagBleReports, (unsigned long)diagStrongFrames,
+            (unsigned long)alertQueueDrops, (unsigned long)diagLocalAdminTargetHits);
+
+  bool anyNear = false;
+  for (uint8_t i = 0; i < DIAG_NEAR_FRAME_SLOTS; i++) {
+    uint8_t idx = (uint8_t)((nearHead + DIAG_NEAR_FRAME_SLOTS - 1 - i) % DIAG_NEAR_FRAME_SLOTS);
+    if (nearFrames[idx].seq == 0) continue;
+    anyNear = true;
+    char mac[18];
+    char flags[48];
+    macToStr(nearFrames[idx].mac, mac, sizeof(mac));
+    diagFormatFlags(nearFrames[idx].flags, flags, sizeof(flags));
+    cmdPrintf("near seq=%lu src=%s mac=%s rssi=%d ch=%u subtype=%u flags=%s",
+              (unsigned long)nearFrames[idx].seq, diagSourceName(nearFrames[idx].source),
+              mac, nearFrames[idx].rssi, (unsigned)nearFrames[idx].channel,
+              (unsigned)nearFrames[idx].subtype, flags);
+  }
+  if (!anyNear) cmdPrintf("near=none");
+}
+
+static void serialSetDiag(const char* arg) {
+  if (argEquals(arg, "on")) {
+    diagPeriodicEnabled = true;
+    diagLastPrintAt = 0;
+  } else if (argEquals(arg, "off")) {
+    diagPeriodicEnabled = false;
+  } else if (arg && arg[0]) {
+    cmdPrintf("usage: diag [on|off]");
+    return;
+  }
+  serialPrintDiag();
+}
+
 static void serialResetSession() {
   fyDetCount = 0;
   fyDirty = true;
@@ -3377,6 +3531,8 @@ static void serialExecuteCommand(char* raw) {
     serialPrintStorage();
   } else if (argEquals(argv[0], "detections")) {
     serialPrintDetections();
+  } else if (argEquals(argv[0], "diag")) {
+    serialSetDiag(argc > 1 ? argv[1] : nullptr);
   } else if (argEquals(argv[0], "reset") && argEquals(argc > 1 ? argv[1] : nullptr, "session")) {
     serialResetSession();
   } else if (argEquals(argv[0], "save")) {
@@ -3397,6 +3553,13 @@ static void serialExecuteCommand(char* raw) {
   } else {
     cmdPrintf("unknown command: %s (try help)", argv[0]);
   }
+}
+
+static void diagTick() {
+  if (!diagPeriodicEnabled) return;
+  if (diagLastPrintAt && (millis() - diagLastPrintAt) < DIAG_PRINT_INTERVAL_MS) return;
+  diagLastPrintAt = millis();
+  serialPrintDiag();
 }
 
 static void serialCommandTick() {
@@ -3545,6 +3708,7 @@ void loop() {
   activityTick();
   gpsTick();
   serialCommandTick();
+  diagTick();
   webServer.handleClient();
   rssiTrackExpire();
   heartbeatTick();     // audible beep-pair while a target is still in range

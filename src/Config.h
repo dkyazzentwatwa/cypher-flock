@@ -74,11 +74,14 @@
 
 #define ENABLE_SSID_MATCH 1
 #define CHECK_ADDR1 1
-#define CHECK_ADDR3 0
+#define CHECK_ADDR3 1
 #define STOP_ON_SSID_HIT 0
 #define STOP_ON_OUI_HIT  0
 #define PROCESS_MGMT_FRAMES 1
 #define PROCESS_DATA_FRAMES 1
+
+#define DIAG_NEAR_RSSI_MIN     -55
+#define DIAG_PRINT_INTERVAL_MS  10000
 
 #define MAX_DETECTIONS       200
 #define FY_SESSION_FILE      "/session.json"
